@@ -28,9 +28,7 @@ func NewResourceScopeResolver(
 }
 
 func (r *ResourceScopeResolver) IsNamespaced(resource string) (bool, error) {
-	gvr, err := r.mapper.ResourceFor(schema.GroupVersionResource{
-		Resource: resource,
-	})
+	gvr, err := r.ResourceFor(resource)
 	if err != nil {
 		return false, err
 	}
@@ -46,6 +44,12 @@ func (r *ResourceScopeResolver) IsNamespaced(resource string) (bool, error) {
 	}
 
 	return mapping.Scope.Name() == meta.RESTScopeNameNamespace, nil
+}
+
+func (r *ResourceScopeResolver) ResourceFor(resource string) (schema.GroupVersionResource, error) {
+	return r.mapper.ResourceFor(schema.GroupVersionResource{
+		Resource: resource,
+	})
 }
 
 func GetNamespacedResources(dc discovery.DiscoveryInterface) ([]string, error) {
