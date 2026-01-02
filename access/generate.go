@@ -81,20 +81,39 @@ func runGenerate(name string, isServiceAccount bool) error {
 		return err
 	}
 
-	// Check scope flags vs resource scope
-	// This logic is partially duplicated from ValidateCommonFlags but needed if we want to be sure about namespaced bool
-	// ValidateCommonFlags ensures:
-	// - if cluster resource, namespace is cleared and clusterScope is set
-	// - if namespaced resource, namespace is default if not set
-	// So we can rely on `namespaced` variable from resolver and `clusterScope` flag to some extent,
-	// but strictly speaking ValidateCommonFlags handles the error cases.
-
 	if namespaced && clusterScope {
-		// Should have been caught by ValidateCommonFlags, but safe check
 		return fmt.Errorf("cannot use --clusterscope with namespaced resource %s", resource)
 	}
 
-	// Generate Manifests
+	// Try to resolve group
+	var group string
+	gvr, err := resolver.ResourceFor(resource)
+	if err == nil {
+		group = gvr.Group
+	}
+
+	roleBytes, bindingBytes, err := generateManifests(name, isServiceAccount, resource, group, verbs, userNamespace, namespaced)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(string(roleBytes))
+	fmt.Println("---")
+	fmt.Println(string(bindingBytes))
+
+	return nil
+}
+
+func generateManifests(
+	name string,
+	isServiceAccount bool,
+	resource string,
+	group string,
+	verbs []string,
+	namespace string,
+	namespaced bool,
+) ([]byte, []byte, error) {
+
 	var roleBytes, bindingBytes []byte
 
 	if namespaced {
@@ -109,25 +128,18 @@ func runGenerate(name string, isServiceAccount bool) error {
 			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      roleName,
-				Namespace: userNamespace,
+				Namespace: namespace,
 			},
 			Rules: []rbacv1.PolicyRule{
 				{
-					APIGroups: []string{"*"}, // Simple assumption, or resolve group from resource
+					APIGroups: []string{group},
 					Resources: []string{resource},
 					Verbs:     verbs,
 				},
 			},
 		}
-
-		// Try to resolve group
-		gvr, err := resolver.ResourceFor(resource)
-		if err == nil {
-			if gvr.Group == "" {
-				role.Rules[0].APIGroups = []string{""}
-			} else {
-				role.Rules[0].APIGroups = []string{gvr.Group}
-			}
+		if group == "" {
+			role.Rules[0].APIGroups = []string{""}
 		}
 
 		subject := rbacv1.Subject{
@@ -137,9 +149,7 @@ func runGenerate(name string, isServiceAccount bool) error {
 		if isServiceAccount {
 			subject.Kind = "ServiceAccount"
 			subject.Name = name
-			// SA requires namespace in subject usually if bindings cross ns,
-			// but for local binding it's good practice.
-			subject.Namespace = userNamespace
+			subject.Namespace = namespace
 		}
 
 		binding := &rbacv1.RoleBinding{
@@ -149,7 +159,7 @@ func runGenerate(name string, isServiceAccount bool) error {
 			},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      bindingName,
-				Namespace: userNamespace,
+				Namespace: namespace,
 			},
 			Subjects: []rbacv1.Subject{subject},
 			RoleRef: rbacv1.RoleRef{
@@ -177,20 +187,14 @@ func runGenerate(name string, isServiceAccount bool) error {
 			},
 			Rules: []rbacv1.PolicyRule{
 				{
-					APIGroups: []string{"*"},
+					APIGroups: []string{group},
 					Resources: []string{resource},
 					Verbs:     verbs,
 				},
 			},
 		}
-		// Try to resolve group
-		gvr, err := resolver.ResourceFor(resource)
-		if err == nil {
-			if gvr.Group == "" {
-				role.Rules[0].APIGroups = []string{""}
-			} else {
-				role.Rules[0].APIGroups = []string{gvr.Group}
-			}
+		if group == "" {
+			role.Rules[0].APIGroups = []string{""}
 		}
 
 		subject := rbacv1.Subject{
@@ -200,13 +204,10 @@ func runGenerate(name string, isServiceAccount bool) error {
 		if isServiceAccount {
 			subject.Kind = "ServiceAccount"
 			subject.Name = name
-			// SA needs namespace even in ClusterRoleBinding
-			// If we are generating for a cluster scoped resource, where does the SA live?
-			// We should probably rely on `userNamespace` which defaults to "default" or whatever user passed via -n
-			if userNamespace == "" {
+			if namespace == "" {
 				subject.Namespace = "default"
 			} else {
-				subject.Namespace = userNamespace
+				subject.Namespace = namespace
 			}
 		}
 
@@ -230,9 +231,5 @@ func runGenerate(name string, isServiceAccount bool) error {
 		bindingBytes, _ = yaml.Marshal(binding)
 	}
 
-	fmt.Println(string(roleBytes))
-	fmt.Println("---")
-	fmt.Println(string(bindingBytes))
-
-	return nil
+	return roleBytes, bindingBytes, nil
 }

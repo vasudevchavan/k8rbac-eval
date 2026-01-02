@@ -7,5 +7,4 @@ rules:
   - apiGroups: [""] # "" means core API group
     resources:
       - pods
-      - deployments
     verbs: ["get", "list", "watch"] # read-only verbs
