@@ -12,4 +12,6 @@ var AccessCmd = &cobra.Command{
 func init() {
 	AccessCmd.AddCommand(UserCmd)
 	AccessCmd.AddCommand(SaCmd)
+	AccessCmd.AddCommand(GenerateCmd)
+	AccessCmd.AddCommand(VersionCmd)
 }

@@ -46,6 +46,7 @@ func init() {
 	// when this action is called directly.
 	rootCmd.AddCommand(access.AccessCmd)
 	rootCmd.AddCommand(access.GenerateCmd)
+	rootCmd.AddCommand(access.VersionCmd)
 	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 
 }
