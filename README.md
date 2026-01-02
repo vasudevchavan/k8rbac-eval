@@ -105,6 +105,20 @@ kubeaccess generate user bob --resource deployments --verb create --verb delete
 
 Generate a ClusterRole for a service account to view nodes:
 
-```bash
+# Generate a ClusterRole for a service account to view nodes
+
 kubeaccess generate sa monitor-sa --resource nodes --verb get --verb list --clusterscope
-```
+
+# Generate a ClusterRole for a user 'deployer' to access nodes
+
+kubeaccess generate user deployer --resource=nodes --verb=list,get,watch -c
+
+````
+
+### Checking Cluster-Wide Access
+
+Check all cluster-scoped access for user `alice`:
+
+```bash
+kubeaccess show user alice -c
+````
