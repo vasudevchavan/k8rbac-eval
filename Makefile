@@ -56,10 +56,12 @@ ui-install:
 
 ## ui-dev (mock): start UI + mock API in one terminal (no cluster needed)
 ui-dev:
+	@[ -d ui/node_modules/vite ] || (echo "→ Installing UI dependencies..." && cd ui && npm install)
 	cd ui && npm start
 
 ## ui-start (real): build binary then run real Go API server + Vite together
 ui-start: build
+	@[ -d ui/node_modules/vite ] || (echo "→ Installing UI dependencies..." && cd ui && npm install)
 	@echo "Starting Go API server on :8080 and Vite UI on :3000"
 	@trap 'kill 0' INT; \
 	  KUBEACCESS_BIN=./bin/$(BINARY_NAME) go run ./cmd/server/main.go & \
