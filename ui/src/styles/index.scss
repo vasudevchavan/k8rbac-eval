@@ -1,0 +1,59 @@
+// Carbon styles — use direct node_modules path so Vite/sass can resolve it
+@use '@carbon/styles/scss/config' with ($prefix: 'cds');
+@use '@carbon/styles/scss/theme' with ($theme: ());
+@use '@carbon/styles/scss/themes';
+@use '@carbon/styles/scss/components';
+@use '@carbon/styles/scss/grid';
+@use '@carbon/styles/scss/reset';
+@use '@carbon/styles/scss/type';
+
+// Global overrides
+body {
+  margin: 0;
+  background-color: var(--cds-background);
+  color: var(--cds-text-primary);
+}
+
+.kubeaccess-content {
+  padding: 2rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.output-panel {
+  margin-top: 2rem;
+
+  .cds--code-snippet--multi {
+    max-height: 480px;
+  }
+}
+
+.verb-checkbox-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  margin-top: 0.5rem;
+}
+
+.results-table-wrapper {
+  margin-top: 1.5rem;
+  overflow-x: auto;
+}
+
+.access-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-weight: 600;
+
+  &--allowed {
+    color: var(--cds-support-success);
+  }
+  &--denied {
+    color: var(--cds-support-error);
+  }
+}
+
+.tab-panel-inner {
+  padding-top: 2rem;
+}

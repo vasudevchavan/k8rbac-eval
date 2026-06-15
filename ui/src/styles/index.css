@@ -1,0 +1,47 @@
+/* Global overrides on top of Carbon */
+body {
+  margin: 0;
+  background-color: var(--cds-background);
+  color: var(--cds-text-primary);
+}
+
+.kubeaccess-content {
+  padding: 2rem;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.output-panel {
+  margin-top: 2rem;
+}
+
+.verb-checkbox-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  margin-top: 0.5rem;
+}
+
+.results-table-wrapper {
+  margin-top: 1.5rem;
+  overflow-x: auto;
+}
+
+.access-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-weight: 600;
+}
+
+.access-badge--allowed {
+  color: var(--cds-support-success);
+}
+
+.access-badge--denied {
+  color: var(--cds-support-error);
+}
+
+.tab-panel-inner {
+  padding-top: 2rem;
+}
