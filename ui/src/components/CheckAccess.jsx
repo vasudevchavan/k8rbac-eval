@@ -16,6 +16,9 @@ import {
   TableHeader,
   TableBody,
   TableCell,
+  TableToolbar,
+  TableToolbarContent,
+  TableToolbarSearch,
   InlineLoading,
   InlineNotification,
   Tag,
@@ -32,24 +35,179 @@ const COMMON_RESOURCES = [
 ]
 
 /**
- * Parse the plaintext output of `kubeaccess show` into rows.
- * Each line looks like:   get    : true
+ * Parse the combined stdout+stderr from `kubeaccess show`.
+ *
+ * slog TextHandler lines look like:
+ *   time=... level=INFO msg="Inspecting access" user=alice resource=pods namespace=default
+ *
+ * Access result lines look like:
+ *   get    : true
+ *
+ * Returns an array of { id, resource, verb, allowed }.
+ * `resource` is empty-string when only one resource was checked.
  */
 function parseOutput(raw) {
   const rows = []
+  let currentResource = ''
+  let rowIdx = 0
+
   for (const line of raw.split('\n')) {
-    const m = line.match(/^\s*(\S+)\s*:\s*(true|false)\s*$/i)
-    if (m) {
-      rows.push({ id: m[1], verb: m[1], allowed: m[2].toLowerCase() === 'true' })
+    // Extract resource name from slog key=value output
+    const resMatch = line.match(/\bresource=(\S+)/)
+    if (resMatch) {
+      currentResource = resMatch[1]
+      continue
+    }
+
+    // Match verb result lines: "  get    : true"
+    const verbMatch = line.match(/^\s*(\w+)\s*:\s*(true|false)\s*$/i)
+    if (verbMatch) {
+      rows.push({
+        id: String(rowIdx++),
+        resource: currentResource,
+        verb: verbMatch[1],
+        allowed: verbMatch[2].toLowerCase() === 'true',
+      })
     }
   }
+
   return rows
 }
 
-const headers = [
-  { key: 'verb', header: 'Verb' },
-  { key: 'allowed', header: 'Allowed' },
-]
+/** True when the result set spans more than one resource */
+function isMultiResource(rows) {
+  const resources = new Set(rows.map((r) => r.resource).filter(Boolean))
+  return resources.size > 1
+}
+
+function AllowedBadge({ allowed }) {
+  return (
+    <span className={`access-badge access-badge--${allowed ? 'allowed' : 'denied'}`}>
+      {allowed ? <><Checkmark size={16} /> Allowed</> : <><Close size={16} /> Denied</>}
+    </span>
+  )
+}
+
+/** Single-resource table: Verb | Allowed */
+function SingleResourceTable({ rows }) {
+  const headers = [
+    { key: 'verb', header: 'Verb' },
+    { key: 'allowed', header: 'Allowed' },
+  ]
+  return (
+    <DataTable rows={rows} headers={headers} isSortable>
+      {({ rows: tRows, headers, getTableProps, getHeaderProps, getRowProps }) => (
+        <Table {...getTableProps()} size="sm">
+          <TableHead>
+            <TableRow>
+              {headers.map((h) => (
+                <TableHeader key={h.key} {...getHeaderProps({ header: h })}>{h.header}</TableHeader>
+              ))}
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {tRows.map((row) => {
+              const original = rows.find((r) => r.id === row.id)
+              return (
+                <TableRow key={row.id} {...getRowProps({ row })}>
+                  {row.cells.map((cell) => (
+                    <TableCell key={cell.id}>
+                      {cell.info.header === 'allowed'
+                        ? <AllowedBadge allowed={original?.allowed} />
+                        : <code>{cell.value}</code>}
+                    </TableCell>
+                  ))}
+                </TableRow>
+              )
+            })}
+          </TableBody>
+        </Table>
+      )}
+    </DataTable>
+  )
+}
+
+/** Multi-resource table: Resource | Verb | Allowed  (with toolbar search) */
+function MultiResourceTable({ rows }) {
+  const [filter, setFilter] = useState('')
+
+  const headers = [
+    { key: 'resource', header: 'Resource' },
+    { key: 'verb', header: 'Verb' },
+    { key: 'allowed', header: 'Allowed' },
+  ]
+
+  const filtered = filter
+    ? rows.filter(
+        (r) =>
+          r.resource.toLowerCase().includes(filter.toLowerCase()) ||
+          r.verb.toLowerCase().includes(filter.toLowerCase()),
+      )
+    : rows
+
+  return (
+    <DataTable rows={filtered} headers={headers} isSortable>
+      {({ rows: tRows, headers, getTableProps, getHeaderProps, getRowProps, getToolbarProps }) => (
+        <>
+          <TableToolbar {...getToolbarProps()}>
+            <TableToolbarContent>
+              <TableToolbarSearch
+                placeholder="Filter resource or verb…"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                persistent
+              />
+            </TableToolbarContent>
+          </TableToolbar>
+          <Table {...getTableProps()} size="sm">
+            <TableHead>
+              <TableRow>
+                {headers.map((h) => (
+                  <TableHeader key={h.key} {...getHeaderProps({ header: h })}>{h.header}</TableHeader>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {tRows.map((row) => {
+                const original = filtered.find((r) => r.id === row.id)
+                // Detect first row of each resource group to render a divider
+                const rowIdx = tRows.indexOf(row)
+                const prevRow = rowIdx > 0 ? tRows[rowIdx - 1] : null
+                const prevOriginal = prevRow ? filtered.find((r) => r.id === prevRow.id) : null
+                const isNewResource = !prevOriginal || prevOriginal.resource !== original?.resource
+
+                return (
+                  <TableRow
+                    key={row.id}
+                    {...getRowProps({ row })}
+                    style={isNewResource && rowIdx > 0
+                      ? { borderTop: '2px solid var(--cds-border-subtle-01)' }
+                      : {}}
+                  >
+                    {row.cells.map((cell) => (
+                      <TableCell key={cell.id}>
+                        {cell.info.header === 'allowed' ? (
+                          <AllowedBadge allowed={original?.allowed} />
+                        ) : cell.info.header === 'resource' ? (
+                          // Only show resource name on the first row of each group
+                          isNewResource
+                            ? <Tag type="blue" size="sm">{cell.value}</Tag>
+                            : null
+                        ) : (
+                          <code>{cell.value}</code>
+                        )}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
+        </>
+      )}
+    </DataTable>
+  )
+}
 
 export default function CheckAccess() {
   const [subjectType, setSubjectType] = useState('user')
@@ -60,7 +218,7 @@ export default function CheckAccess() {
   const [kubeconfig, setKubeconfig] = useState('')
 
   const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState(null)   // { rows, rawOutput, serverError }
+  const [result, setResult] = useState(null)
   const [formError, setFormError] = useState('')
 
   const handleSubmit = async (e) => {
@@ -85,7 +243,13 @@ export default function CheckAccess() {
         serverError: data.error || null,
       })
     } catch (err) {
-      setResult({ rows: [], rawOutput: '', serverError: err.response?.data?.error || err.message })
+      const msg = err.response?.data?.error || err.message
+      if (err.response?.status === 400 && msg.includes('not found')) {
+        setFormError(msg)
+        setResult(null)
+      } else {
+        setResult({ rows: [], rawOutput: '', serverError: msg })
+      }
     } finally {
       setLoading(false)
     }
@@ -95,6 +259,8 @@ export default function CheckAccess() {
     setName(''); setNamespace('default'); setResource('')
     setClusterScope(false); setResult(null); setFormError('')
   }
+
+  const multiResource = result ? isMultiResource(result.rows) : false
 
   return (
     <div className="tab-panel-inner">
@@ -115,7 +281,7 @@ export default function CheckAccess() {
             <RadioButton labelText="Service Account" value="sa" id="check-type-sa" />
           </RadioButtonGroup>
 
-          {/* Name + namespace row */}
+          {/* Name + namespace */}
           <Grid narrow>
             <Column sm={4} md={4} lg={6}>
               <TextInput
@@ -141,9 +307,11 @@ export default function CheckAccess() {
             </Column>
           </Grid>
 
-          {/* Resource — quick-pick chips + free-text */}
+          {/* Resource quick-pick */}
           <div>
-            <p className="cds--label">Resource <span style={{ color: 'var(--cds-text-helper)' }}>(optional — blank = all)</span></p>
+            <p className="cds--label">
+              Resource <span style={{ color: 'var(--cds-text-helper)' }}>(optional — blank = all resources)</span>
+            </p>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.75rem' }}>
               {COMMON_RESOURCES.map((r) => (
                 <Tag
@@ -166,7 +334,7 @@ export default function CheckAccess() {
             />
           </div>
 
-          {/* Cluster scope toggle */}
+          {/* Cluster scope */}
           <Toggle
             id="check-clusterscope"
             labelText="Cluster-scoped check"
@@ -184,7 +352,13 @@ export default function CheckAccess() {
             <Button kind="secondary" onClick={reset} disabled={loading}>Reset</Button>
           </div>
 
-          {loading && <InlineLoading description="Running kubeaccess show…" />}
+          {loading && (
+            <InlineLoading description={
+              resource
+                ? `Checking ${resource} permissions…`
+                : 'Checking all resource permissions (this may take a moment)…'
+            } />
+          )}
         </Stack>
       </Form>
 
@@ -194,66 +368,42 @@ export default function CheckAccess() {
           {result.serverError && (
             <InlineNotification
               kind="error"
-              title="Error"
+              title="Access check failed"
               subtitle={result.serverError}
               lowContrast
             />
           )}
 
-          {result.rows.length > 0 ? (
-            <div className="results-table-wrapper">
-              <DataTable rows={result.rows} headers={headers} isSortable>
-                {({ rows, headers, getTableProps, getHeaderProps, getRowProps }) => (
-                  <Table {...getTableProps()} size="sm">
-                    <TableHead>
-                      <TableRow>
-                        {headers.map((h) => (
-                          <TableHeader key={h.key} {...getHeaderProps({ header: h })}>
-                            {h.header}
-                          </TableHeader>
-                        ))}
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {rows.map((row) => {
-                        const allowedCell = row.cells.find((c) => c.info.header === 'allowed')
-                        const isAllowed = result.rows.find((r) => r.id === row.id)?.allowed
-                        return (
-                          <TableRow key={row.id} {...getRowProps({ row })}>
-                            {row.cells.map((cell) => (
-                              <TableCell key={cell.id}>
-                                {cell.info.header === 'allowed' ? (
-                                  <span className={`access-badge access-badge--${isAllowed ? 'allowed' : 'denied'}`}>
-                                    {isAllowed
-                                      ? <><Checkmark size={16} /> Allowed</>
-                                      : <><Close size={16} /> Denied</>}
-                                  </span>
-                                ) : (
-                                  <code>{cell.value}</code>
-                                )}
-                              </TableCell>
-                            ))}
-                          </TableRow>
-                        )
-                      })}
-                    </TableBody>
-                  </Table>
-                )}
-              </DataTable>
-            </div>
-          ) : (
-            !result.serverError && (
-              <InlineNotification
-                kind="info"
-                title="No results"
-                subtitle="No access data returned. Try a different resource or subject."
-                lowContrast
-                hideCloseButton
-              />
-            )
+          {result.rows.length > 0 && (
+            <>
+              {multiResource && (
+                <p style={{ fontSize: '0.875rem', color: 'var(--cds-text-secondary)', marginBottom: '0.75rem' }}>
+                  Showing permissions across <strong>{new Set(result.rows.map(r => r.resource)).size}</strong> resources
+                  — {result.rows.filter(r => r.allowed).length} allowed,{' '}
+                  {result.rows.filter(r => !r.allowed).length} denied.
+                  Use the search box to filter.
+                </p>
+              )}
+
+              <div className="results-table-wrapper">
+                {multiResource
+                  ? <MultiResourceTable rows={result.rows} />
+                  : <SingleResourceTable rows={result.rows} />}
+              </div>
+            </>
           )}
 
-          {/* Raw output collapsible */}
+          {result.rows.length === 0 && !result.serverError && (
+            <InlineNotification
+              kind="info"
+              title="No results"
+              subtitle="No access data returned. The subject may have no permissions, or try a different resource."
+              lowContrast
+              hideCloseButton
+            />
+          )}
+
+          {/* Raw output */}
           {result.rawOutput && (
             <details style={{ marginTop: '1rem' }}>
               <summary style={{ cursor: 'pointer', color: 'var(--cds-link-primary)', fontSize: '0.875rem' }}>

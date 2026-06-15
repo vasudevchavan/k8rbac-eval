@@ -194,6 +194,67 @@ func handleCheck(binary string) http.HandlerFunc {
 			return
 		}
 
+		// Validate subject existence before running the access check.
+		// Kubernetes impersonation works for any subject (even non-existent ones),
+		// so without this check we'd silently return all-denied results for a typo'd
+		// SA or a user that has never been granted any RBAC.
+		if subjectType == "sa" {
+			// Service accounts are namespaced resources — check directly.
+			ns := req.Namespace
+			if ns == "" {
+				ns = "default"
+			}
+			kubectlArgs := []string{"get", "sa", req.Name, "-n", ns}
+			kubectlCmd := exec.Command("kubectl", kubectlArgs...)
+			kubectlCmd.Env = os.Environ()
+			if req.Kubeconfig != "" {
+				kubectlCmd.Env = append(kubectlCmd.Env, "KUBECONFIG="+req.Kubeconfig)
+			}
+			if out, err := kubectlCmd.CombinedOutput(); err != nil {
+				msg := strings.TrimSpace(string(out))
+				if msg == "" {
+					msg = err.Error()
+				}
+				writeJSON(w, http.StatusBadRequest, APIResponse{
+					Error: fmt.Sprintf("service account %q not found in namespace %q: %s", req.Name, ns, msg),
+				})
+				return
+			}
+		} else {
+			// Users are not stored as Kubernetes objects, but we can check whether
+			// the username appears as a subject in any RoleBinding or ClusterRoleBinding.
+			// If not, the user has no RBAC configured and the check result would be
+			// misleading (all-denied looks the same as "user doesn't exist").
+			jsonArgs := []string{
+				"get", "rolebindings,clusterrolebindings",
+				"--all-namespaces",
+				"-o", "jsonpath={.items[*].subjects[*].name}",
+			}
+			rbCmd := exec.Command("kubectl", jsonArgs...)
+			rbCmd.Env = os.Environ()
+			if req.Kubeconfig != "" {
+				rbCmd.Env = append(rbCmd.Env, "KUBECONFIG="+req.Kubeconfig)
+			}
+			if out, err := rbCmd.CombinedOutput(); err == nil {
+				subjects := strings.Fields(string(out))
+				found := false
+				for _, s := range subjects {
+					if s == req.Name {
+						found = true
+						break
+					}
+				}
+				if !found {
+					writeJSON(w, http.StatusBadRequest, APIResponse{
+						Error: fmt.Sprintf("user %q has no RoleBinding or ClusterRoleBinding in this cluster — they may not exist or have never been granted access", req.Name),
+					})
+					return
+				}
+			}
+			// If kubectl itself fails (permissions, connectivity), skip the check and
+			// let kubeaccess proceed — it will surface any real errors.
+		}
+
 		args := []string{"show", subjectType, req.Name}
 
 		if req.Resource != "" {
@@ -204,15 +265,25 @@ func handleCheck(binary string) http.HandlerFunc {
 		} else if req.Namespace != "" {
 			args = append(args, "--namespace", req.Namespace)
 		}
-		if req.Kubeconfig != "" {
-			args = append(args, "--kubeconfig", req.Kubeconfig)
-		}
 
 		slog.Info("running check", "args", args)
-		out, err := exec.Command(binary, args...).CombinedOutput()
+		checkCmd := exec.Command(binary, args...)
+		// Propagate env; override KUBECONFIG if the caller specified one.
+		checkCmd.Env = os.Environ()
+		if req.Kubeconfig != "" {
+			checkCmd.Env = append(checkCmd.Env, "KUBECONFIG="+req.Kubeconfig)
+		}
+		out, err := checkCmd.CombinedOutput()
 		resp := APIResponse{Output: string(out)}
 		if err != nil {
-			resp.Error = err.Error()
+			// Prefer the CLI's own output over the bare "exit status N" string —
+			// it contains the actual error message (e.g. permission denied, API unreachable).
+			if msg := strings.TrimSpace(string(out)); msg != "" {
+				resp.Error = msg
+			} else {
+				resp.Error = err.Error()
+			}
+			slog.Error("kubeaccess check failed", "error", err, "output", string(out))
 			writeJSON(w, http.StatusInternalServerError, resp)
 			return
 		}
@@ -262,15 +333,22 @@ func handleGenerate(binary string) http.HandlerFunc {
 		} else if req.Namespace != "" {
 			args = append(args, "--namespace", req.Namespace)
 		}
-		if req.Kubeconfig != "" {
-			args = append(args, "--kubeconfig", req.Kubeconfig)
-		}
 
 		slog.Info("running generate", "args", args)
-		out, err := exec.Command(binary, args...).CombinedOutput()
+		genCmd := exec.Command(binary, args...)
+		genCmd.Env = os.Environ()
+		if req.Kubeconfig != "" {
+			genCmd.Env = append(genCmd.Env, "KUBECONFIG="+req.Kubeconfig)
+		}
+		out, err := genCmd.CombinedOutput()
 		resp := APIResponse{Output: string(out)}
 		if err != nil {
-			resp.Error = err.Error()
+			if msg := strings.TrimSpace(string(out)); msg != "" {
+				resp.Error = msg
+			} else {
+				resp.Error = err.Error()
+			}
+			slog.Error("kubeaccess generate failed", "error", err, "output", string(out))
 			writeJSON(w, http.StatusInternalServerError, resp)
 			return
 		}

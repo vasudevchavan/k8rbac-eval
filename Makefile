@@ -2,7 +2,7 @@
 
 BINARY_NAME=kubeaccess
 
-.PHONY: all build build-all clean run fmt vet
+.PHONY: all build build-all clean run fmt vet ui ui-install ui-dev
 .PHONY: build-linux-amd64 build-linux-arm64
 .PHONY: build-darwin-amd64 build-darwin-arm64
 .PHONY: build-windows-amd64
@@ -47,4 +47,22 @@ fmt:
 
 vet:
 	go vet ./...
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+## ui-install: install Node dependencies for the React UI
+ui-install:
+	cd ui && npm install
+
+## ui-dev (mock): start UI + mock API in one terminal (no cluster needed)
+ui-dev:
+	cd ui && npm start
+
+## ui-start (real): build binary then run real Go API server + Vite together
+ui-start: build
+	@echo "Starting Go API server on :8080 and Vite UI on :3000"
+	@trap 'kill 0' INT; \
+	  KUBEACCESS_BIN=./bin/$(BINARY_NAME) go run ./cmd/server/main.go & \
+	  (cd ui && npx vite) & \
+	  wait
 
