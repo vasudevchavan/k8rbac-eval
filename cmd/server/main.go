@@ -2,16 +2,16 @@
 // HTTP API server that wraps the kubeaccess CLI for the Carbon/React UI.
 //
 // Endpoints:
-//   POST /api/check    – run `kubeaccess show {user|sa} <name> [flags]`
-//   POST /api/generate – run `kubeaccess generate {user|sa} <name> [flags]`
-//   GET  /api/health   – liveness probe
-//
-// The server looks for the kubeaccess binary in $PATH, then alongside itself,
-// then in the project's bin/ directory.
+//   GET  /api/platform    – detected cluster platform + flags
+//   POST /api/check       – run `kubeaccess show {user|sa} <name> [flags]`
+//   POST /api/generate    – run `kubeaccess generate {user|sa} <name> [flags]`
+//   GET  /api/kubeconfigs – list available kubeconfig files
+//   GET  /api/health      – liveness probe
 
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -21,6 +21,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
+
+	"github.com/vasudevchavan/k8s-get-access-level/pkg/client"
+	"github.com/vasudevchavan/k8s-get-access-level/pkg/platform"
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -28,12 +33,12 @@ import (
 // ────────────────────────────────────────────────────────────────────────────
 
 type CheckRequest struct {
-	SubjectType  string `json:"subjectType"`  // "user" | "sa"
-	Name         string `json:"name"`         // username or service account name
-	Namespace    string `json:"namespace"`    // optional, default "default"
-	Resource     string `json:"resource"`     // optional; empty = all resources
-	ClusterScope bool   `json:"clusterScope"` // -c flag
-	Kubeconfig   string `json:"kubeconfig"`   // optional path to kubeconfig file
+	SubjectType  string `json:"subjectType"` // "user" | "sa"
+	Name         string `json:"name"`
+	Namespace    string `json:"namespace"`
+	Resource     string `json:"resource"`
+	ClusterScope bool   `json:"clusterScope"`
+	Kubeconfig   string `json:"kubeconfig"`
 }
 
 type GenerateRequest struct {
@@ -41,20 +46,78 @@ type GenerateRequest struct {
 	Name         string   `json:"name"`
 	Namespace    string   `json:"namespace"`
 	Resource     string   `json:"resource"`
-	Verbs        []string `json:"verbs"` // e.g. ["get","list","watch"]
+	Verbs        []string `json:"verbs"`
 	ClusterScope bool     `json:"clusterScope"`
-	Kubeconfig   string   `json:"kubeconfig"` // optional path to kubeconfig file
+	Kubeconfig   string   `json:"kubeconfig"`
 }
 
-// KubeconfigListResponse lists available kubeconfig files
 type KubeconfigListResponse struct {
 	Files   []string `json:"files"`
 	Default string   `json:"default"`
 }
 
 type APIResponse struct {
-	Output string `json:"output"`
-	Error  string `json:"error,omitempty"`
+	Output   string   `json:"output"`
+	Error    string   `json:"error,omitempty"`
+	Warnings []string `json:"warnings,omitempty"` // non-fatal advisories (IRSA, Workload Identity, etc.)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Platform cache — detect once per unique kubeconfig path
+// ────────────────────────────────────────────────────────────────────────────
+
+type platformCache struct {
+	mu    sync.RWMutex
+	cache map[string]platform.Info
+}
+
+var pCache = &platformCache{cache: make(map[string]platform.Info)}
+
+func (c *platformCache) get(key string) (platform.Info, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.cache[key]
+	return v, ok
+}
+
+func (c *platformCache) set(key string, info platform.Info) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache[key] = info
+}
+
+// detectPlatform returns (cached) platform info for a kubeconfig path.
+func detectPlatform(kubeconfig string) platform.Info {
+	key := kubeconfig
+	if key == "" {
+		key = "__default__"
+	}
+	if info, ok := pCache.get(key); ok {
+		return info
+	}
+
+	if kubeconfig != "" {
+		_ = os.Setenv("KUBECONFIG", kubeconfig)
+	}
+	k8sClient, err := client.GetClientset()
+	if err != nil {
+		slog.Warn("platform detection: could not build client", "error", err)
+		info := platform.Info{Platform: platform.TypeVanilla, DisplayName: "Kubernetes"}
+		pCache.set(key, info)
+		return info
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	info := platform.Detect(ctx, k8sClient)
+	slog.Info("detected cluster platform",
+		"platform", info.Platform,
+		"displayName", info.DisplayName,
+		"azureRBACMode", info.AzureRBACMode,
+	)
+	pCache.set(key, info)
+	return info
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -62,17 +125,12 @@ type APIResponse struct {
 // ────────────────────────────────────────────────────────────────────────────
 
 func findBinary() (string, error) {
-	// 1. $KUBEACCESS_BIN env override
 	if env := os.Getenv("KUBEACCESS_BIN"); env != "" {
 		return env, nil
 	}
-
-	// 2. $PATH
 	if p, err := exec.LookPath("kubeaccess"); err == nil {
 		return p, nil
 	}
-
-	// 3. Alongside this server binary
 	exe, err := os.Executable()
 	if err == nil {
 		candidate := filepath.Join(filepath.Dir(exe), "kubeaccess")
@@ -83,8 +141,6 @@ func findBinary() (string, error) {
 			return candidate, nil
 		}
 	}
-
-	// 4. Project bin/ relative to CWD
 	cwd, _ := os.Getwd()
 	for _, dir := range []string{
 		filepath.Join(cwd, "bin"),
@@ -102,12 +158,11 @@ func findBinary() (string, error) {
 			}
 		}
 	}
-
 	return "", fmt.Errorf("kubeaccess binary not found; set KUBEACCESS_BIN or add it to $PATH")
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Handlers
+// Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -116,12 +171,115 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// buildEnv returns os.Environ() with KUBECONFIG overridden when kubeconfig != "".
+func buildEnv(kubeconfig string) []string {
+	env := os.Environ()
+	if kubeconfig != "" {
+		env = append(env, "KUBECONFIG="+kubeconfig)
+	}
+	return env
+}
+
+// roleBindingUserExists returns true when username appears as a subject in any
+// RoleBinding or ClusterRoleBinding across all namespaces.
+func roleBindingUserExists(kubeconfig, username string) bool {
+	cmd := exec.Command("kubectl",
+		"get", "rolebindings,clusterrolebindings",
+		"--all-namespaces",
+		"-o", "jsonpath={.items[*].subjects[*].name}",
+	)
+	cmd.Env = buildEnv(kubeconfig)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	for _, s := range strings.Fields(string(out)) {
+		if s == username {
+			return true
+		}
+	}
+	return false
+}
+
+// validateUser checks whether a user exists on the cluster.
+// Returns (found, skip): skip=true means we cannot determine existence
+// and the request should proceed without blocking.
+func validateUser(ctx context.Context, pInfo platform.Info, kubeconfig, username string) (found, skip bool) {
+	if kubeconfig != "" {
+		_ = os.Setenv("KUBECONFIG", kubeconfig)
+	}
+	typedClient, err := client.GetClientset()
+	if err != nil {
+		return false, true // can't validate, let through
+	}
+
+	switch pInfo.Platform {
+
+	case platform.TypeOpenShift:
+		// Check real OpenShift User object first
+		if exists, _ := platform.OpenShiftUserExists(ctx, typedClient, username); exists {
+			return true, false
+		}
+		// Fall back to RoleBinding scan for system users / service users
+		return roleBindingUserExists(kubeconfig, username), false
+
+	case platform.TypeEKS:
+		// Check aws-auth ConfigMap; skip if absent (EKS Access Entries clusters)
+		if exists, err := platform.EKSUserExists(ctx, typedClient, username); err == nil {
+			if exists {
+				return true, false
+			}
+		} else {
+			return false, true // can't determine
+		}
+		// Also check RoleBindings for users with direct k8s bindings
+		return roleBindingUserExists(kubeconfig, username), false
+
+	case platform.TypeAKS:
+		if pInfo.AzureRBACMode {
+			// Azure RBAC mode: users never appear in Kubernetes RoleBindings
+			return false, true
+		}
+		return roleBindingUserExists(kubeconfig, username), false
+
+	default:
+		return roleBindingUserExists(kubeconfig, username), false
+	}
+}
+
+func buildUserNotFoundMsg(pInfo platform.Info, username string) string {
+	switch pInfo.Platform {
+	case platform.TypeOpenShift:
+		return fmt.Sprintf(
+			"user %q not found on this OpenShift cluster — "+
+				"no User object exists and no RoleBinding references this username", username)
+	case platform.TypeEKS:
+		return fmt.Sprintf(
+			"user %q not found — "+
+				"not in aws-auth ConfigMap and has no RoleBinding on this EKS cluster", username)
+	default:
+		return fmt.Sprintf(
+			"user %q has no RoleBinding or ClusterRoleBinding in this cluster — "+
+				"they may not exist or have never been granted access", username)
+	}
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Handlers
+// ────────────────────────────────────────────────────────────────────────────
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// handleKubeconfigs lists kubeconfig files found in ~/.kube/ and any paths
-// in the KUBECONFIG env var.
+// handlePlatform detects and returns the cluster platform + flags.
+// Query param: ?kubeconfig=<path>  (optional)
+func handlePlatform(w http.ResponseWriter, r *http.Request) {
+	kubeconfig := r.URL.Query().Get("kubeconfig")
+	info := detectPlatform(kubeconfig)
+	writeJSON(w, http.StatusOK, info)
+}
+
 func handleKubeconfigs(w http.ResponseWriter, r *http.Request) {
 	seen := map[string]bool{}
 	var files []string
@@ -136,7 +294,6 @@ func handleKubeconfigs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// KUBECONFIG env (colon-separated on Unix, semicolon on Windows)
 	sep := ":"
 	if runtime.GOOS == "windows" {
 		sep = ";"
@@ -145,12 +302,10 @@ func handleKubeconfigs(w http.ResponseWriter, r *http.Request) {
 		addFile(strings.TrimSpace(p))
 	}
 
-	// ~/.kube/config (default)
 	home, _ := os.UserHomeDir()
 	defaultCfg := filepath.Join(home, ".kube", "config")
 	addFile(defaultCfg)
 
-	// Any other *.yaml / *.yml files in ~/.kube/
 	kubeDir := filepath.Join(home, ".kube")
 	if entries, err := os.ReadDir(kubeDir); err == nil {
 		for _, e := range entries {
@@ -183,7 +338,6 @@ func handleCheck(binary string) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, APIResponse{Error: "invalid JSON: " + err.Error()})
 			return
 		}
-
 		if req.Name == "" {
 			writeJSON(w, http.StatusBadRequest, APIResponse{Error: "name is required"})
 			return
@@ -194,23 +348,21 @@ func handleCheck(binary string) http.HandlerFunc {
 			return
 		}
 
-		// Validate subject existence before running the access check.
-		// Kubernetes impersonation works for any subject (even non-existent ones),
-		// so without this check we'd silently return all-denied results for a typo'd
-		// SA or a user that has never been granted any RBAC.
+		ctx := r.Context()
+		pInfo := detectPlatform(req.Kubeconfig)
+
+		var warnings []string
+
 		if subjectType == "sa" {
-			// Service accounts are namespaced resources — check directly.
 			ns := req.Namespace
 			if ns == "" {
 				ns = "default"
 			}
-			kubectlArgs := []string{"get", "sa", req.Name, "-n", ns}
-			kubectlCmd := exec.Command("kubectl", kubectlArgs...)
-			kubectlCmd.Env = os.Environ()
-			if req.Kubeconfig != "" {
-				kubectlCmd.Env = append(kubectlCmd.Env, "KUBECONFIG="+req.Kubeconfig)
-			}
-			if out, err := kubectlCmd.CombinedOutput(); err != nil {
+
+			// Validate SA existence via kubectl
+			saCmd := exec.Command("kubectl", "get", "sa", req.Name, "-n", ns)
+			saCmd.Env = buildEnv(req.Kubeconfig)
+			if out, err := saCmd.CombinedOutput(); err != nil {
 				msg := strings.TrimSpace(string(out))
 				if msg == "" {
 					msg = err.Error()
@@ -220,43 +372,33 @@ func handleCheck(binary string) http.HandlerFunc {
 				})
 				return
 			}
+
+			// Cloud identity annotation warnings (IRSA / Workload Identity)
+			if kubeconfig := req.Kubeconfig; kubeconfig != "" {
+				_ = os.Setenv("KUBECONFIG", kubeconfig)
+			}
+			if k8sClient, err := client.GetClientset(); err == nil {
+				warnings = platform.SACloudWarnings(ctx, k8sClient, req.Name, ns)
+			}
+
 		} else {
-			// Users are not stored as Kubernetes objects, but we can check whether
-			// the username appears as a subject in any RoleBinding or ClusterRoleBinding.
-			// If not, the user has no RBAC configured and the check result would be
-			// misleading (all-denied looks the same as "user doesn't exist").
-			jsonArgs := []string{
-				"get", "rolebindings,clusterrolebindings",
-				"--all-namespaces",
-				"-o", "jsonpath={.items[*].subjects[*].name}",
+			// Platform-aware user validation
+			found, skip := validateUser(ctx, pInfo, req.Kubeconfig, req.Name)
+			if !skip && !found {
+				writeJSON(w, http.StatusBadRequest, APIResponse{
+					Error: buildUserNotFoundMsg(pInfo, req.Name),
+				})
+				return
 			}
-			rbCmd := exec.Command("kubectl", jsonArgs...)
-			rbCmd.Env = os.Environ()
-			if req.Kubeconfig != "" {
-				rbCmd.Env = append(rbCmd.Env, "KUBECONFIG="+req.Kubeconfig)
+			if pInfo.AzureRBACMode {
+				warnings = append(warnings, "This AKS cluster uses Azure RBAC. "+
+					"Access shown here reflects Kubernetes RBAC only. "+
+					"Azure role assignments are not visible via Kubernetes APIs.")
 			}
-			if out, err := rbCmd.CombinedOutput(); err == nil {
-				subjects := strings.Fields(string(out))
-				found := false
-				for _, s := range subjects {
-					if s == req.Name {
-						found = true
-						break
-					}
-				}
-				if !found {
-					writeJSON(w, http.StatusBadRequest, APIResponse{
-						Error: fmt.Sprintf("user %q has no RoleBinding or ClusterRoleBinding in this cluster — they may not exist or have never been granted access", req.Name),
-					})
-					return
-				}
-			}
-			// If kubectl itself fails (permissions, connectivity), skip the check and
-			// let kubeaccess proceed — it will surface any real errors.
 		}
 
+		// Build and run kubeaccess check
 		args := []string{"show", subjectType, req.Name}
-
 		if req.Resource != "" {
 			args = append(args, "--resource", req.Resource)
 		}
@@ -266,18 +408,12 @@ func handleCheck(binary string) http.HandlerFunc {
 			args = append(args, "--namespace", req.Namespace)
 		}
 
-		slog.Info("running check", "args", args)
+		slog.Info("running check", "args", args, "platform", pInfo.Platform)
 		checkCmd := exec.Command(binary, args...)
-		// Propagate env; override KUBECONFIG if the caller specified one.
-		checkCmd.Env = os.Environ()
-		if req.Kubeconfig != "" {
-			checkCmd.Env = append(checkCmd.Env, "KUBECONFIG="+req.Kubeconfig)
-		}
+		checkCmd.Env = buildEnv(req.Kubeconfig)
 		out, err := checkCmd.CombinedOutput()
-		resp := APIResponse{Output: string(out)}
+		resp := APIResponse{Output: string(out), Warnings: warnings}
 		if err != nil {
-			// Prefer the CLI's own output over the bare "exit status N" string —
-			// it contains the actual error message (e.g. permission denied, API unreachable).
 			if msg := strings.TrimSpace(string(out)); msg != "" {
 				resp.Error = msg
 			} else {
@@ -303,7 +439,6 @@ func handleGenerate(binary string) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, APIResponse{Error: "invalid JSON: " + err.Error()})
 			return
 		}
-
 		if req.Name == "" {
 			writeJSON(w, http.StatusBadRequest, APIResponse{Error: "name is required"})
 			return
@@ -319,7 +454,6 @@ func handleGenerate(binary string) http.HandlerFunc {
 		}
 
 		args := []string{"generate", subjectType, req.Name, "--resource", req.Resource}
-
 		verbs := req.Verbs
 		if len(verbs) == 0 {
 			verbs = []string{"get", "list", "watch"}
@@ -327,19 +461,17 @@ func handleGenerate(binary string) http.HandlerFunc {
 		for _, v := range verbs {
 			args = append(args, "--verb", v)
 		}
-
 		if req.ClusterScope {
 			args = append(args, "--clusterscope")
 		} else if req.Namespace != "" {
 			args = append(args, "--namespace", req.Namespace)
 		}
 
-		slog.Info("running generate", "args", args)
+		pInfo := detectPlatform(req.Kubeconfig)
+		slog.Info("running generate", "args", args, "platform", pInfo.Platform)
+
 		genCmd := exec.Command(binary, args...)
-		genCmd.Env = os.Environ()
-		if req.Kubeconfig != "" {
-			genCmd.Env = append(genCmd.Env, "KUBECONFIG="+req.Kubeconfig)
-		}
+		genCmd.Env = buildEnv(req.Kubeconfig)
 		out, err := genCmd.CombinedOutput()
 		resp := APIResponse{Output: string(out)}
 		if err != nil {
@@ -352,12 +484,22 @@ func handleGenerate(binary string) http.HandlerFunc {
 			writeJSON(w, http.StatusInternalServerError, resp)
 			return
 		}
+
+		// On OpenShift, surface an advisory about User subject kinds
+		if pInfo.Platform == platform.TypeOpenShift && subjectType == "user" {
+			resp.Warnings = []string{
+				"On OpenShift, subjects of Kind 'User' refer to OpenShift User objects " +
+					"(via user.openshift.io). The generated manifest uses standard " +
+					"rbac.authorization.k8s.io subjects which work correctly on OpenShift.",
+			}
+		}
+
 		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// CORS middleware (for Vite dev proxy passthrough)
+// CORS middleware
 // ────────────────────────────────────────────────────────────────────────────
 
 func withCORS(next http.Handler) http.Handler {
@@ -387,8 +529,12 @@ func main() {
 	}
 	slog.Info("using kubeaccess binary", "path", binary)
 
+	// Eagerly detect platform at startup using the default kubeconfig
+	go func() { detectPlatform("") }()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", handleHealth)
+	mux.HandleFunc("/api/platform", handlePlatform)
 	mux.HandleFunc("/api/kubeconfigs", handleKubeconfigs)
 	mux.HandleFunc("/api/check", handleCheck(binary))
 	mux.HandleFunc("/api/generate", handleGenerate(binary))

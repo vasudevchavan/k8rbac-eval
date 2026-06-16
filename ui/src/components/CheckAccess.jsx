@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useCallback } from 'react'
 import {
   Form,
   Stack,
@@ -27,12 +27,24 @@ import { Search, Checkmark, Close } from '@carbon/icons-react'
 import KubeconfigSelector from './KubeconfigSelector'
 import { checkAccess } from '../api/client'
 
-const COMMON_RESOURCES = [
+// Base resources shown on all platforms
+const BASE_RESOURCES = [
   'pods', 'deployments', 'services', 'secrets', 'configmaps',
   'namespaces', 'nodes', 'persistentvolumes', 'ingresses',
   'serviceaccounts', 'roles', 'rolebindings', 'clusterroles',
   'clusterrolebindings',
 ]
+
+// Extra resources shown when a specific platform is detected
+const PLATFORM_RESOURCES = {
+  openshift: [
+    'routes', 'projects', 'buildconfigs', 'imagestreams',
+    'deploymentconfigs', 'securitycontextconstraints', 'operatorgroups',
+  ],
+  eks: [], // standard k8s resources; IRSA is IAM-level, not k8s
+  aks: [], // standard k8s resources; Azure RBAC is Azure-level
+  kubernetes: [],
+}
 
 /**
  * Parse the combined stdout+stderr from `kubeaccess show`.
@@ -216,10 +228,19 @@ export default function CheckAccess() {
   const [resource, setResource] = useState('')
   const [clusterScope, setClusterScope] = useState(false)
   const [kubeconfig, setKubeconfig] = useState('')
+  const [platformInfo, setPlatformInfo] = useState(null)
 
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState(null)
   const [formError, setFormError] = useState('')
+
+  const handlePlatform = useCallback((info) => setPlatformInfo(info), [])
+
+  // Build the full resource list for the current platform
+  const allResources = [
+    ...BASE_RESOURCES,
+    ...(PLATFORM_RESOURCES[platformInfo?.platform] ?? []),
+  ]
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -241,6 +262,7 @@ export default function CheckAccess() {
         rows: parseOutput(data.output),
         rawOutput: data.output,
         serverError: data.error || null,
+        warnings: data.warnings || [],
       })
     } catch (err) {
       const msg = err.response?.data?.error || err.message
@@ -266,8 +288,8 @@ export default function CheckAccess() {
     <div className="tab-panel-inner">
       <Form onSubmit={handleSubmit}>
         <Stack gap={6}>
-          {/* Kubeconfig */}
-          <KubeconfigSelector value={kubeconfig} onChange={setKubeconfig} />
+          {/* Kubeconfig + platform badge */}
+          <KubeconfigSelector value={kubeconfig} onChange={setKubeconfig} onPlatform={handlePlatform} />
 
           {/* Subject type */}
           <RadioButtonGroup
@@ -313,7 +335,7 @@ export default function CheckAccess() {
               Resource <span style={{ color: 'var(--cds-text-helper)' }}>(optional — blank = all resources)</span>
             </p>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.75rem' }}>
-              {COMMON_RESOURCES.map((r) => (
+              {allResources.map((r) => (
                 <Tag
                   key={r}
                   type={resource === r ? 'blue' : 'gray'}
@@ -365,6 +387,18 @@ export default function CheckAccess() {
       {/* Results */}
       {result && (
         <div className="output-panel">
+          {/* Cloud identity / platform warnings (IRSA, Workload Identity, Azure RBAC) */}
+          {result.warnings?.map((w, i) => (
+            <InlineNotification
+              key={i}
+              kind="warning"
+              title="Advisory"
+              subtitle={w}
+              lowContrast
+              style={{ marginBottom: '0.5rem' }}
+            />
+          ))}
+
           {result.serverError && (
             <InlineNotification
               kind="error"

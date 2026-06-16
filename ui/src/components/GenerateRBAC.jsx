@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useCallback } from 'react'
 import {
   Form,
   Stack,
@@ -21,12 +21,22 @@ import { generateRBAC } from '../api/client'
 const ALL_VERBS = ['get', 'list', 'watch', 'create', 'update', 'patch', 'delete', 'deletecollection']
 const DEFAULT_VERBS = new Set(['get', 'list', 'watch'])
 
-const COMMON_RESOURCES = [
+const BASE_RESOURCES = [
   'pods', 'deployments', 'services', 'secrets', 'configmaps',
   'namespaces', 'nodes', 'persistentvolumes', 'ingresses',
   'serviceaccounts', 'roles', 'rolebindings', 'clusterroles',
   'clusterrolebindings',
 ]
+
+const PLATFORM_RESOURCES = {
+  openshift: [
+    'routes', 'projects', 'buildconfigs', 'imagestreams',
+    'deploymentconfigs', 'securitycontextconstraints', 'operatorgroups',
+  ],
+  eks: [],
+  aks: [],
+  kubernetes: [],
+}
 
 export default function GenerateRBAC() {
   const [subjectType, setSubjectType] = useState('user')
@@ -36,10 +46,18 @@ export default function GenerateRBAC() {
   const [verbs, setVerbs] = useState(new Set(DEFAULT_VERBS))
   const [clusterScope, setClusterScope] = useState(false)
   const [kubeconfig, setKubeconfig] = useState('')
+  const [platformInfo, setPlatformInfo] = useState(null)
 
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState(null)
   const [formErrors, setFormErrors] = useState({})
+
+  const handlePlatform = useCallback((info) => setPlatformInfo(info), [])
+
+  const allResources = [
+    ...BASE_RESOURCES,
+    ...(PLATFORM_RESOURCES[platformInfo?.platform] ?? []),
+  ]
 
   const toggleVerb = (verb) => {
     setVerbs((prev) => {
@@ -75,9 +93,13 @@ export default function GenerateRBAC() {
         clusterScope,
         kubeconfig,
       })
-      setResult({ yaml: data.output, serverError: data.error || null })
+      setResult({
+        yaml: data.output,
+        serverError: data.error || null,
+        warnings: data.warnings || [],
+      })
     } catch (err) {
-      setResult({ yaml: '', serverError: err.response?.data?.error || err.message })
+      setResult({ yaml: '', serverError: err.response?.data?.error || err.message, warnings: [] })
     } finally {
       setLoading(false)
     }
@@ -108,8 +130,8 @@ export default function GenerateRBAC() {
     <div className="tab-panel-inner">
       <Form onSubmit={handleSubmit}>
         <Stack gap={6}>
-          {/* Kubeconfig */}
-          <KubeconfigSelector value={kubeconfig} onChange={setKubeconfig} />
+          {/* Kubeconfig + platform badge */}
+          <KubeconfigSelector value={kubeconfig} onChange={setKubeconfig} onPlatform={handlePlatform} />
 
           {/* Subject type */}
           <RadioButtonGroup
@@ -148,13 +170,18 @@ export default function GenerateRBAC() {
             </Column>
           </Grid>
 
-          {/* Resource */}
+          {/* Resource quick-pick (platform-aware) */}
           <div>
             <p className="cds--label">
               Resource <span style={{ color: 'var(--cds-support-error)' }}>*</span>
+              {platformInfo?.platform === 'openshift' && (
+                <span style={{ color: 'var(--cds-text-helper)', fontWeight: 400, marginLeft: '0.5rem' }}>
+                  — includes OpenShift-specific resources
+                </span>
+              )}
             </p>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.75rem' }}>
-              {COMMON_RESOURCES.map((r) => (
+              {allResources.map((r) => (
                 <button
                   key={r}
                   type="button"
@@ -235,6 +262,18 @@ export default function GenerateRBAC() {
       {/* Output */}
       {result && (
         <div className="output-panel">
+          {/* Platform / cloud advisories */}
+          {result.warnings?.map((w, i) => (
+            <InlineNotification
+              key={i}
+              kind="info"
+              title="Advisory"
+              subtitle={w}
+              lowContrast
+              style={{ marginBottom: '0.5rem' }}
+            />
+          ))}
+
           {result.serverError && (
             <InlineNotification
               kind="error"

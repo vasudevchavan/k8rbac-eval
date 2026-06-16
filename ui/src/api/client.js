@@ -3,6 +3,17 @@ import axios from 'axios'
 const api = axios.create({ baseURL: '/api' })
 
 /**
+ * Detect the cluster platform for a given kubeconfig.
+ * @param {string} [kubeconfig] - optional kubeconfig path
+ * @returns {{ platform: string, displayName: string, azureRbacMode?: boolean }}
+ */
+export async function fetchPlatform(kubeconfig = '') {
+  const params = kubeconfig ? { kubeconfig } : {}
+  const { data } = await api.get('/platform', { params })
+  return data
+}
+
+/**
  * Fetch available kubeconfig files from the server.
  * @returns {{ files: string[], default: string }}
  */
