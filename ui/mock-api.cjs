@@ -12,13 +12,33 @@ const KUBECONFIGS = {
   default: `${process.env.HOME}/.kube/config`,
 }
 
-const CHECK_OUTPUT = `  get    : true
-  list   : true
-  watch  : true
-  create : false
-  update : false
-  patch  : false
-  delete : false
+// Multi-resource mock output matching the CLI's printAccess format:
+//   resource: <name>
+//     <verb>                : <true|false>
+const CHECK_OUTPUT = `resource: pods
+  get                : true
+  list               : true
+  watch              : true
+  create             : false
+  update             : false
+  patch              : false
+  delete             : false
+resource: deployments
+  get                : true
+  list               : true
+  watch              : true
+  create             : false
+  update             : false
+  patch              : false
+  delete             : false
+resource: secrets
+  get                : false
+  list               : false
+  watch              : false
+  create             : false
+  update             : false
+  patch              : false
+  delete             : false
 `
 
 const GENERATE_OUTPUT = `apiVersion: rbac.authorization.k8s.io/v1
@@ -65,8 +85,9 @@ http.createServer((req, res) => {
 
   console.log(`${new Date().toISOString()}  ${req.method} ${req.url}`)
 
-  if (req.url === '/api/health')      return json(res, 200, { status: 'ok' })
-  if (req.url === '/api/kubeconfigs') return json(res, 200, KUBECONFIGS)
+  if (req.url === '/api/health')                        return json(res, 200, { status: 'ok' })
+  if (req.url === '/api/kubeconfigs')                   return json(res, 200, KUBECONFIGS)
+  if (req.url.startsWith('/api/platform'))              return json(res, 200, { platform: 'kubernetes', displayName: 'Kubernetes', azureRbacMode: false })
 
   if (req.url === '/api/check' && req.method === 'POST') {
     let body = ''

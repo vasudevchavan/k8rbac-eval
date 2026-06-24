@@ -47,16 +47,15 @@ const PLATFORM_RESOURCES = {
 }
 
 /**
- * Parse the combined stdout+stderr from `kubeaccess show`.
+ * Parse the stdout from `kubeaccess show`.
  *
- * slog TextHandler lines look like:
- *   time=... level=INFO msg="Inspecting access" user=alice resource=pods namespace=default
- *
- * Access result lines look like:
- *   get    : true
+ * CLI output format (one block per resource):
+ *   resource: pods
+ *     get                : true
+ *     list               : true
+ *     ...
  *
  * Returns an array of { id, resource, verb, allowed }.
- * `resource` is empty-string when only one resource was checked.
  */
 function parseOutput(raw) {
   const rows = []
@@ -64,14 +63,14 @@ function parseOutput(raw) {
   let rowIdx = 0
 
   for (const line of raw.split('\n')) {
-    // Extract resource name from slog key=value output
-    const resMatch = line.match(/\bresource=(\S+)/)
+    // "resource: pods"
+    const resMatch = line.match(/^resource:\s*(\S+)/)
     if (resMatch) {
       currentResource = resMatch[1]
       continue
     }
 
-    // Match verb result lines: "  get    : true"
+    // "  get                : true"
     const verbMatch = line.match(/^\s*(\w+)\s*:\s*(true|false)\s*$/i)
     if (verbMatch) {
       rows.push({

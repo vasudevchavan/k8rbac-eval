@@ -2,6 +2,8 @@
 
 `kubeaccess` is a CLI tool for inspecting Kubernetes RBAC access levels for users and service accounts, and for generating ready-to-apply Role/ClusterRole manifests. It includes a Carbon Design System / React web UI backed by a lightweight Go API server.
 
+**Further reading:** [Architecture](docs/architecture.md) · [Development guide](docs/development.md)
+
 ## Features
 
 - **Check Access** — verify which verbs a user or service account has on any resource, namespace- or cluster-wide

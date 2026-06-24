@@ -32,6 +32,7 @@ import (
 	"github.com/vasudevchavan/k8s-get-access-level/pkg/client"
 	"github.com/vasudevchavan/k8s-get-access-level/pkg/platform"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8s "k8s.io/client-go/kubernetes"
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -69,6 +70,34 @@ type APIResponse struct {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Client cache — reuse *kubernetes.Clientset per kubeconfig path so TLS is
+// negotiated once and all requests share the same HTTP/2 connection pool.
+// ────────────────────────────────────────────────────────────────────────────
+
+// k8sClientCache stores *kubernetes.Clientset values keyed by kubeconfig path
+// (or "__default__" for the default resolution path).
+var k8sClientCache sync.Map
+
+// getCachedClient returns a cached clientset for kubeconfig, building one on
+// first use. Concurrent callers for the same key race to store; LoadOrStore
+// ensures only one instance is kept.
+func getCachedClient(kubeconfig string) (*k8s.Clientset, error) {
+	key := kubeconfig
+	if key == "" {
+		key = "__default__"
+	}
+	if v, ok := k8sClientCache.Load(key); ok {
+		return v.(*k8s.Clientset), nil
+	}
+	c, err := client.GetClientsetWithKubeconfig(kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := k8sClientCache.LoadOrStore(key, c)
+	return actual.(*k8s.Clientset), nil
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Platform cache — detect once per unique kubeconfig path
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -103,7 +132,7 @@ func detectPlatform(kubeconfig string) platform.Info {
 		return info
 	}
 
-	k8sClient, err := client.GetClientsetWithKubeconfig(kubeconfig)
+	k8sClient, err := getCachedClient(kubeconfig)
 	if err != nil {
 		slog.Warn("platform detection: could not build client", "error", err)
 		info := platform.Info{Platform: platform.TypeVanilla, DisplayName: "Kubernetes"}
@@ -197,7 +226,7 @@ func buildEnv(kubeconfig string) []string {
 // RoleBinding or ClusterRoleBinding across all namespaces.
 // Uses client-go rather than shelling out to kubectl.
 func roleBindingUserExists(ctx context.Context, kubeconfig, username string) bool {
-	k8sClient, err := client.GetClientsetWithKubeconfig(kubeconfig)
+	k8sClient, err := getCachedClient(kubeconfig)
 	if err != nil {
 		return false
 	}
@@ -233,7 +262,7 @@ func roleBindingUserExists(ctx context.Context, kubeconfig, username string) boo
 // Returns (found, skip): skip=true means we cannot determine existence
 // and the request should proceed without blocking.
 func validateUser(ctx context.Context, pInfo platform.Info, kubeconfig, username string) (found, skip bool) {
-	typedClient, err := client.GetClientsetWithKubeconfig(kubeconfig)
+	typedClient, err := getCachedClient(kubeconfig)
 	if err != nil {
 		return false, true // can't validate, let through
 	}
@@ -388,8 +417,8 @@ func handleCheck(binary string) http.HandlerFunc {
 				ns = "default"
 			}
 
-			// Validate SA existence via client-go
-			k8sClient, err := client.GetClientsetWithKubeconfig(req.Kubeconfig)
+			// Validate SA existence via the cached client
+			k8sClient, err := getCachedClient(req.Kubeconfig)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, APIResponse{Error: "failed to build k8s client: " + err.Error()})
 				return
@@ -437,15 +466,20 @@ func handleCheck(binary string) http.HandlerFunc {
 		slog.Info("running check", "args", args, "platform", pInfo.Platform)
 		checkCmd := exec.Command(binary, args...)
 		checkCmd.Env = buildEnv(req.Kubeconfig)
-		out, err := checkCmd.CombinedOutput()
-		resp := APIResponse{Output: string(out), Warnings: warnings}
+		// Capture stdout (parseable results) and stderr (slog noise) separately
+		// so the UI only receives clean structured output, not log lines.
+		var stdout, stderr strings.Builder
+		checkCmd.Stdout = &stdout
+		checkCmd.Stderr = &stderr
+		err := checkCmd.Run()
+		resp := APIResponse{Output: stdout.String(), Warnings: warnings}
 		if err != nil {
-			if msg := strings.TrimSpace(string(out)); msg != "" {
-				resp.Error = msg
-			} else {
-				resp.Error = err.Error()
+			errOut := strings.TrimSpace(stderr.String())
+			if errOut == "" {
+				errOut = err.Error()
 			}
-			slog.Error("kubeaccess check failed", "error", err, "output", string(out))
+			resp.Error = errOut
+			slog.Error("kubeaccess check failed", "error", err, "stderr", errOut)
 			writeJSON(w, http.StatusInternalServerError, resp)
 			return
 		}
@@ -501,15 +535,18 @@ func handleGenerate(binary string) http.HandlerFunc {
 
 		genCmd := exec.Command(binary, args...)
 		genCmd.Env = buildEnv(req.Kubeconfig)
-		out, err := genCmd.CombinedOutput()
-		resp := APIResponse{Output: string(out)}
+		var genStdout, genStderr strings.Builder
+		genCmd.Stdout = &genStdout
+		genCmd.Stderr = &genStderr
+		err := genCmd.Run()
+		resp := APIResponse{Output: genStdout.String()}
 		if err != nil {
-			if msg := strings.TrimSpace(string(out)); msg != "" {
-				resp.Error = msg
-			} else {
-				resp.Error = err.Error()
+			errOut := strings.TrimSpace(genStderr.String())
+			if errOut == "" {
+				errOut = err.Error()
 			}
-			slog.Error("kubeaccess generate failed", "error", err, "output", string(out))
+			resp.Error = errOut
+			slog.Error("kubeaccess generate failed", "error", err, "stderr", errOut)
 			writeJSON(w, http.StatusInternalServerError, resp)
 			return
 		}

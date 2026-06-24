@@ -18,6 +18,13 @@ func init() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 }
 
+// discCache is a process-wide discovery cache shared across CLI invocations in
+// the same process (useful when the binary is embedded in the server).
+var discCache = discovery.NewResourceCache(discovery.DefaultCacheTTL)
+
+// orderedVerbs defines the fixed print order so output is always deterministic.
+var orderedVerbs = []string{"get", "list", "watch", "create", "update", "patch", "delete"}
+
 // AccessOptions holds validated flag values shared across show and generate commands.
 type AccessOptions struct {
 	UserNamespace string
@@ -81,23 +88,16 @@ func ValidateCommonFlags(cmd *cobra.Command, args []string) (AccessOptions, erro
 		nsFlag := cmd.Flags().Changed("namespace")
 		csFlag := cmd.Flags().Changed("clusterscope")
 
-		// user passed --namespace for cluster-scoped resource
 		if !namespaced && nsFlag {
 			return opts, fmt.Errorf("resource %q is cluster-scoped; --namespace is not allowed", opts.Resource)
 		}
-
-		// user passed --clusterscope for namespaced resource
 		if namespaced && csFlag && opts.ClusterScope {
 			return opts, fmt.Errorf("resource %q is namespaced; --clusterscope is not allowed", opts.Resource)
 		}
-
-		// auto-set clusterScope for cluster-scoped resources
 		if !namespaced {
 			opts.ClusterScope = true
 			opts.UserNamespace = ""
 		}
-
-		// default namespace for namespaced resources
 		if namespaced && !nsFlag {
 			opts.UserNamespace = "default"
 		}
@@ -109,12 +109,12 @@ func ValidateCommonFlags(cmd *cobra.Command, args []string) (AccessOptions, erro
 func RunAccessCheck(cmd *cobra.Command, args []string, isServiceAccount bool, opts AccessOptions) error {
 	username := args[0]
 	displayUsername := username
+
 	if isServiceAccount {
 		saNamespace := opts.UserNamespace
 		if saNamespace == "" {
 			saNamespace = "default"
 		}
-		// Construct the full service account name: system:serviceaccount:<ns>:<name>
 		if !strings.HasPrefix(username, "system:serviceaccount:") {
 			username = fmt.Sprintf("system:serviceaccount:%s:%s", saNamespace, username)
 		}
@@ -150,62 +150,100 @@ func RunAccessCheck(cmd *cobra.Command, args []string, isServiceAccount bool, op
 		return fmt.Errorf("error creating impersonated client: %w", err)
 	}
 
-	var resourcesToCheck []string
+	checker := access.NewKubeChecker(impClient)
+
+	// ── Single resource ───────────────────────────────────────────────────────
+	// Check uses parallel verb calls internally (~7× faster than sequential).
 	if opts.Resource != "" {
-		resourcesToCheck = []string{opts.Resource}
-	} else {
-		resourcesToCheck, err = discovery.GetAllResources(clientset.Discovery())
-		if err != nil {
-			return fmt.Errorf("error fetching resources: %w", err)
+		ns := opts.UserNamespace
+		if opts.ClusterScope {
+			ns = ""
 		}
+		slog.Info("inspecting access", "subject", displayUsername, "resource", opts.Resource)
+		accessMap, err := checker.Check(cmd.Context(), opts.Resource, ns)
+		if err != nil {
+			return fmt.Errorf("access check failed: %w", err)
+		}
+		printAccess(opts.Resource, accessMap)
+		return nil
 	}
 
-	for _, res := range resourcesToCheck {
-		// Skip subresources (e.g. pods/exec)
-		if strings.Contains(res, "/") {
-			continue
-		}
+	// ── All resources ─────────────────────────────────────────────────────────
+	// Use the discovery cache to avoid re-hitting the API on repeat runs.
+	allResources, err := discCache.Get(opts.Kubeconfig, clientset.Discovery())
+	if err != nil {
+		return fmt.Errorf("error fetching resources: %w", err)
+	}
 
+	// Filter to only the resources that match the requested scope.
+	var filtered []string
+	for _, res := range allResources {
+		if strings.Contains(res, "/") {
+			continue // skip subresources
+		}
 		namespaced, err := resolver.IsNamespaced(res)
 		if err != nil {
 			slog.Warn("skipping resource", "resource", res, "error", err)
 			continue
 		}
-
-		// Respect --clusterscope: skip resources that don't match the requested scope.
 		if opts.ClusterScope && namespaced {
 			continue
 		}
 		if !opts.ClusterScope && !namespaced {
 			continue
 		}
+		filtered = append(filtered, res)
+	}
 
-		ns := ""
-		if namespaced {
-			ns = opts.UserNamespace
-			slog.Info("inspecting access", "subject", displayUsername, "resource", res, "namespace", ns)
-		} else {
-			slog.Info("inspecting access", "subject", displayUsername, "resource", res, "scope", "cluster")
-		}
+	var allAccess map[string]map[string]bool
 
-		checker := access.NewKubeChecker(impClient)
-		accessMap, err := checker.Check(cmd.Context(), res, ns)
-		if err != nil {
-			slog.Error("error checking access", "resource", res, "error", err)
-			continue
-		}
-
-		// Sort verbs for deterministic output.
-		verbs := make([]string, 0, len(accessMap))
-		for v := range accessMap {
-			verbs = append(verbs, v)
-		}
-		sort.Strings(verbs)
-
-		fmt.Printf("resource: %s\n", res)
-		for _, verb := range verbs {
-			fmt.Printf("  %-18s : %v\n", verb, accessMap[verb])
+	if !opts.ClusterScope {
+		// ── Fast path: SelfSubjectRulesReview (1 API call for everything) ──
+		slog.Info("using SelfSubjectRulesReview", "subject", displayUsername, "namespace", opts.UserNamespace, "resources", len(filtered))
+		result, incomplete, err := checker.CheckAllNamespaced(cmd.Context(), filtered, opts.UserNamespace)
+		switch {
+		case err != nil:
+			slog.Warn("SelfSubjectRulesReview failed, falling back to individual checks", "error", err)
+		case incomplete:
+			slog.Warn("SelfSubjectRulesReview incomplete (webhook authorizer?), falling back to individual checks")
+		default:
+			allAccess = result
 		}
 	}
+
+	if allAccess == nil {
+		// ── Fallback: worker pool — workerCount resources checked concurrently,
+		//    each using parallel verb checks. Good for cluster-scope and
+		//    webhook-authorizer clusters where RulesReview is incomplete.
+		ns := opts.UserNamespace
+		if opts.ClusterScope {
+			ns = ""
+		}
+		slog.Info("checking access via worker pool", "subject", displayUsername, "resources", len(filtered))
+		allAccess, err = checker.CheckAllResources(cmd.Context(), filtered, ns)
+		if err != nil {
+			// Partial results are still printed; log the error and continue.
+			slog.Warn("some resources could not be checked", "error", err)
+		}
+	}
+
+	// Print in stable alphabetical order.
+	sort.Strings(filtered)
+	for _, res := range filtered {
+		verbMap, ok := allAccess[res]
+		if !ok {
+			continue
+		}
+		printAccess(res, verbMap)
+	}
+
 	return nil
+}
+
+// printAccess prints the verb→allowed map for one resource in a fixed verb order.
+func printAccess(resource string, accessMap map[string]bool) {
+	fmt.Printf("resource: %s\n", resource)
+	for _, verb := range orderedVerbs {
+		fmt.Printf("  %-18s : %v\n", verb, accessMap[verb])
+	}
 }
