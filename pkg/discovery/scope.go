@@ -16,7 +16,6 @@ type ResourceScopeResolver struct {
 func NewResourceScopeResolver(
 	dc discovery.DiscoveryInterface,
 ) (*ResourceScopeResolver, error) {
-
 	resources, err := restmapper.GetAPIGroupResources(dc)
 	if err != nil {
 		return nil, err
@@ -52,50 +51,8 @@ func (r *ResourceScopeResolver) ResourceFor(resource string) (schema.GroupVersio
 	})
 }
 
-func GetNamespacedResources(dc discovery.DiscoveryInterface) ([]string, error) {
-	apiGroupResources, err := restmapper.GetAPIGroupResources(dc)
-	if err != nil {
-		return nil, err
-	}
-
-	var namespacedResources []string
-
-	for _, group := range apiGroupResources {
-		for _, resources := range group.VersionedResources {
-			for _, r := range resources {
-				if strings.Contains(r.Name, "/") {
-					continue
-				}
-				if r.Namespaced {
-					namespacedResources = append(namespacedResources, r.Name)
-				}
-			}
-		}
-	}
-
-	return namespacedResources, nil
-}
-
-// GetAllResources returns all Kubernetes resources (namespaced and cluster-scoped)
-// func GetAllResources(discoveryClient discovery.DiscoveryInterface) ([]string, error) {
-// 	apiGroupResources, err := restmapper.GetAPIGroupResources(discoveryClient)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	var resources []string
-
-// 	for _, group := range apiGroupResources {
-// 		for _, resList := range group.VersionedResources {
-// 			for _, r := range resList {
-// 				resources = append(resources, r.Name)
-// 			}
-// 		}
-// 	}
-
-// 	return resources, nil
-// }
-
+// GetAllResources returns all unique top-level Kubernetes resources (no subresources)
+// using the server's preferred API version for each resource group.
 func GetAllResources(discoveryClient discovery.DiscoveryInterface) ([]string, error) {
 	resourceLists, err := discoveryClient.ServerPreferredResources()
 	if err != nil {
@@ -112,7 +69,7 @@ func GetAllResources(discoveryClient discovery.DiscoveryInterface) ([]string, er
 		}
 
 		for _, r := range rl.APIResources {
-			// skip subresources like pods/exec
+			// Skip subresources (e.g. pods/exec, pods/log)
 			if strings.Contains(r.Name, "/") {
 				continue
 			}

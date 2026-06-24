@@ -1,6 +1,10 @@
 import axios from 'axios'
 
-const api = axios.create({ baseURL: '/api' })
+const api = axios.create({
+  baseURL: '/api',
+  // 120 s timeout — "check all resources" can be slow on large clusters.
+  timeout: 120_000,
+})
 
 /**
  * Detect the cluster platform for a given kubeconfig.

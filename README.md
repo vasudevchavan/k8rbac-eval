@@ -1,41 +1,37 @@
 # KubeAccess
 
-`kubeaccess` is a CLI tool designed to inspect Kubernetes RBAC access levels for users and service accounts, and to generate RBAC manifests (Role/RoleBinding or ClusterRole/ClusterRoleBinding).
+`kubeaccess` is a CLI tool for inspecting Kubernetes RBAC access levels for users and service accounts, and for generating ready-to-apply Role/ClusterRole manifests. It includes a Carbon Design System / React web UI backed by a lightweight Go API server.
 
 ## Features
 
-- **Check Access Level**: Verify if a specific user or service account has access to a resource in a namespace or cluster-wide.
-- **Generate RBAC Manifests**: Automatically generate YAML manifests for Roles and Bindings based on desired access.
-- **Impersonation Support**: Uses Kubernetes impersonation to accurately check effective permissions.
-- **Web UI**: Carbon Design System / React frontend with a Go HTTP API server (see [Running the UI](#running-the-ui)).
+- **Check Access** — verify which verbs a user or service account has on any resource, namespace- or cluster-wide
+- **Generate RBAC Manifests** — produce Role/RoleBinding or ClusterRole/ClusterRoleBinding YAML in one command
+- **Impersonation** — uses Kubernetes impersonation so results reflect real effective permissions
+- **Multi-platform detection** — detects EKS, AKS, OpenShift, and surfaces cloud-identity advisories (IRSA, Azure Workload Identity)
+- **Web UI** — Carbon / React frontend with kubeconfig switcher, resource quick-picks, and live YAML output
 
 ## Prerequisites
 
-- Go 1.20+ (for building from source)
+- Go 1.21+ (for building from source)
 - Node.js 18+ and npm (for the UI)
-- A configured `~/.kube/config` file.
-- **Permissions**: The user running this tool must have permissions to impersonate other users and groups (`system:masters` or similar privileges are often required for checking access of others).
+- A kubeconfig pointing at your cluster (`~/.kube/config` or `KUBECONFIG` env)
+- Permission to impersonate users/groups on the cluster (`system:masters` or an equivalent impersonation ClusterRole)
 
 ---
 
 ## Installation
 
-### From Source
-
-Using Make:
+### From source (Make)
 
 ```bash
 git clone https://github.com/vasudevchavan/k8rbac-eval.git
 cd k8rbac-eval
-make build
-# Binary will be in bin/kubeaccess
-
-# Build for all platforms
-make build-all
-# Binaries will be in bin/ with suffixes (e.g., kubeaccess-linux-amd64)
+make build            # → bin/kubeaccess
+make build-server     # → bin/kubeaccess-server (optional, for the UI)
+make build-all        # cross-compile for all platforms → bin/
 ```
 
-Using Go directly:
+### Using Go directly
 
 ```bash
 go install github.com/vasudevchavan/k8s-get-access-level@latest
@@ -45,66 +41,56 @@ go install github.com/vasudevchavan/k8s-get-access-level@latest
 
 ## CLI Usage
 
-The CLI supports two main commands: `show` and `generate`.
+The CLI has two top-level commands: `show` and `generate`.
 
 ### Show Access
 
-Inspect the access level of a user or service account.
-
 ```bash
-# Check user access for a resource in a namespace
-kubeaccess show user <username> -n <namespace> --resource <resource>
-
-# Check service account access
-kubeaccess show sa <serviceaccount> -n <namespace> --resource <resource>
+kubeaccess show user <username>  [flags]
+kubeaccess show sa   <saname>    [flags]
 ```
 
-**Flags:**
-
-- `-n, --namespace`: (Optional) Target namespace (default: `default`).
-- `--resource`: (Optional) The Kubernetes resource to check (e.g., `pods`, `deployments`). Omit to check all resources.
-- `-c, --clusterscope`: (Optional) Check cluster-level access.
-- `--kubeconfig`: (Optional) Path to a kubeconfig file (defaults to `~/.kube/config`).
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-n, --namespace` | `default` | Target namespace |
+| `--resource` | _(all)_ | Resource to check (e.g. `pods`, `deploy`). Omit to check every resource. |
+| `-c, --clusterscope` | `false` | Check cluster-wide access instead of namespace-scoped |
+| `--kubeconfig` | `KUBECONFIG` env → `~/.kube/config` | Path to a kubeconfig file |
 
 ### Generate Manifests
 
-Generate RBAC YAML manifests for a user or service account.
-
 ```bash
-# Generate Role/Binding for a user
-kubeaccess generate user <username> --resource <resource> --verb <verbs>
-
-# Generate Role/Binding for a Service Account
-kubeaccess generate sa <serviceaccount> --resource <resource> --verb <verbs>
+kubeaccess generate user <username>  --resource <resource> [flags]
+kubeaccess generate sa   <saname>    --resource <resource> [flags]
 ```
 
-**Flags:**
-
-- `--verb`: (Optional) Verbs to include in the rule (default: `get`, `list`, `watch`). Can be repeated or comma-separated.
-- `--resource`: (Required) Resource for the Role.
-- `-n, --namespace`: (Optional) Namespace for the Role/Binding.
-- `-c, --clusterscope`: (Optional) Generate a ClusterRole/ClusterRoleBinding instead.
-- `--kubeconfig`: (Optional) Path to a kubeconfig file.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--resource` | _(required)_ | Kubernetes resource (e.g. `pods`, `deployments`) |
+| `--verb` | `get,list,watch` | Verbs to allow; repeatable (`--verb create --verb delete`) |
+| `-n, --namespace` | `default` | Namespace for the Role/RoleBinding |
+| `-c, --clusterscope` | `false` | Generate ClusterRole/ClusterRoleBinding instead |
+| `--kubeconfig` | `KUBECONFIG` env → `~/.kube/config` | Path to a kubeconfig file |
 
 ### Examples
 
 ```bash
-# Check if user alice can access pods in default namespace
+# Check if user alice can access pods in the default namespace
 kubeaccess show user alice -n default --resource pods
 
-# Check if service account my-app has secrets access
+# Check if service account my-app has access to secrets
 kubeaccess show sa my-app -n default --resource secrets
 
 # Check all cluster-scoped access for user alice
 kubeaccess show user alice -c
 
-# Generate a Role allowing bob to create and delete deployments
+# Generate a Role letting bob create and delete deployments
 kubeaccess generate user bob --resource deployments --verb create --verb delete
 
 # Generate a ClusterRole for a service account to view nodes
 kubeaccess generate sa monitor-sa --resource nodes --verb get --verb list -c
 
-# Use a specific kubeconfig
+# Target a different cluster
 kubeaccess show user alice --resource pods --kubeconfig ~/.kube/staging.yaml
 ```
 
@@ -112,85 +98,110 @@ kubeaccess show user alice --resource pods --kubeconfig ~/.kube/staging.yaml
 
 ## Running the UI
 
-The UI is a Carbon Design System / React frontend backed by a lightweight Go HTTP API server that wraps the `kubeaccess` binary.
+The UI is a Carbon / React frontend backed by a Go HTTP API server that wraps the `kubeaccess` binary.
 
-### 1. Build the kubeaccess binary
+### Quickstart (one command)
 
 ```bash
-make build
-# Produces bin/kubeaccess
+make ui-start
+# Builds bin/kubeaccess, starts the Go API server on :8080, and Vite on :3000
 ```
 
-### 2. Start the API server
+### Manual steps
 
-The server auto-discovers the `kubeaccess` binary from `$PATH`, alongside the server binary, or in the project `bin/` directory.
+**1. Build the CLI binary**
 
 ```bash
+make build   # → bin/kubeaccess
+```
+
+**2. Start the API server**
+
+The server auto-discovers the `kubeaccess` binary from `$PATH`, next to the server binary, or in `bin/`.
+
+```bash
+make run-server          # via Make
+# or
 go run ./cmd/server/main.go
-# API listens on :8080 by default
 ```
 
-Optional environment variables:
-
-| Variable          | Default             | Description                              |
-|-------------------|---------------------|------------------------------------------|
-| `PORT`            | `8080`              | Port for the API server                  |
-| `KUBEACCESS_BIN`  | auto-discovered     | Explicit path to the `kubeaccess` binary |
-
-### 3. Start the React dev server
+**3. Start the React dev server**
 
 ```bash
-cd ui
-npm install
-npm run dev
-# Opens http://localhost:3000
+cd ui && npm install && npm run dev
+# Vite opens http://localhost:3000
+# All /api/* requests are proxied to http://localhost:8080
 ```
 
-The Vite dev server proxies all `/api/*` requests to `http://localhost:8080`, so no CORS configuration is needed during development.
-
-### 4. Production build
+**4. Production build**
 
 ```bash
-cd ui
-npm run build
+make ui-build
 # Output in ui/dist/ — serve as static files alongside the Go server
 ```
 
+### Server environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8080` | Listen port for the API server |
+| `KUBEACCESS_BIN` | auto-discovered | Explicit path to the `kubeaccess` binary |
+| `CORS_ORIGIN` | `*` | Allowed CORS origin. Set to your UI's origin in production (e.g. `http://localhost:3000`) |
+
 ---
 
-## UI Options & Features
+## Makefile targets
 
-### Kubeconfig Switcher (top of every form)
+| Target | Description |
+|--------|-------------|
+| `make build` | Build CLI binary → `bin/kubeaccess` |
+| `make build-server` | Build API server binary → `bin/kubeaccess-server` |
+| `make build-all` | Cross-compile CLI for all platforms |
+| `make run` | Run the CLI without building |
+| `make run-server` | Run the API server without building |
+| `make test` | Run all unit tests |
+| `make test-e2e` | Run end-to-end tests (requires a live cluster) |
+| `make fmt` | Format Go source |
+| `make vet` | Run `go vet` |
+| `make lint` | Run `golangci-lint` (must be installed separately) |
+| `make ui-install` | Install Node dependencies |
+| `make ui-build` | Production build of the React UI → `ui/dist/` |
+| `make ui-dev` | Start UI with mock API (no cluster needed) |
+| `make ui-start` | Build CLI + start API server + Vite dev server |
+| `make clean` | Remove `bin/` and Go build cache |
 
-- Automatically lists all kubeconfig files found in `~/.kube/` and the `KUBECONFIG` environment variable.
-- Select any file from the dropdown to target a different cluster.
-- Choose **"Custom path…"** or click **"Enter custom path instead"** to type any absolute path.
-- Leave blank to use the default `~/.kube/config`.
+---
+
+## UI Features
+
+### Kubeconfig Switcher
+
+Every form has a kubeconfig selector that lists all kubeconfigs found in `~/.kube/` and the `KUBECONFIG` env var. Choose **"Custom path…"** to type any absolute path, or leave blank to use the default.
 
 ### Check Access tab
 
 | Option | Description |
 |--------|-------------|
-| Subject type | Toggle between **User** and **Service Account** |
+| Subject type | **User** or **Service Account** |
 | Name | Username or service account name |
 | Namespace | Target namespace (disabled when cluster-scoped) |
-| Resource | Quick-pick chip for common resources, or type any custom resource. Leave blank to check all resources. |
-| Cluster-scoped | Toggle to run a cluster-wide check (`-c` flag) |
+| Resource | Quick-pick chips for common resources, or type a custom resource. Leave blank to check all. |
+| Cluster-scoped | Toggle for cluster-wide check |
 
-Results are displayed in a sortable table showing each verb (`get`, `list`, `watch`, etc.) and whether it is **Allowed** or **Denied**. Raw CLI output is available in a collapsible section.
+Results appear in a sortable table (verb → Allowed/Denied). A collapsible section shows raw CLI output.
 
 ### Generate RBAC tab
 
 | Option | Description |
 |--------|-------------|
-| Subject type | Toggle between **User** and **Service Account** |
+| Subject type | **User** or **Service Account** |
 | Name | Username or service account name |
-| Namespace | Namespace for the Role/Binding (disabled when cluster-scoped) |
-| Resource | Quick-pick chips for common resources, or type any custom resource (required) |
-| Verbs | Checkboxes for all standard Kubernetes verbs (`get`, `list`, `watch`, `create`, `update`, `patch`, `delete`, `deletecollection`) |
-| Cluster-scoped | Toggle to generate a ClusterRole/ClusterRoleBinding instead of Role/RoleBinding |
+| Namespace | Namespace for the Role/Binding |
+| Resource | Required — quick-pick chips or custom input |
+| Verbs | Checkboxes for `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`, `deletecollection` |
+| Cluster-scoped | Generate ClusterRole/ClusterRoleBinding instead |
 
-Output is a ready-to-apply YAML manifest with **Copy** and **Download .yaml** buttons.
+Output is ready-to-apply YAML with **Copy** and **Download .yaml** buttons.
 
 ### Theme switcher
 
@@ -198,12 +209,13 @@ The header includes **Light** / **Dark** theme toggles.
 
 ---
 
-## API Endpoints (Go server)
+## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET`  | `/api/health` | Liveness probe |
-| `GET`  | `/api/kubeconfigs` | List available kubeconfig files |
+| `GET` | `/api/health` | Liveness probe |
+| `GET` | `/api/platform` | Detected cluster platform and flags |
+| `GET` | `/api/kubeconfigs` | List available kubeconfig files |
 | `POST` | `/api/check` | Run `kubeaccess show` |
 | `POST` | `/api/generate` | Run `kubeaccess generate` |
 

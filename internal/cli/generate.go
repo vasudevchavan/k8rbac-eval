@@ -60,15 +60,15 @@ func init() {
 }
 
 func runGenerate(name string, isServiceAccount bool, opts AccessOptions, verbs []string) error {
-	clientset, err := client.GetClientset()
-	if err != nil {
-		return err
-	}
-
-	// Resolve resource aliases if provided
-	// Already resolved in ValidateCommonFlags, so opts.Resource is the resolved name
 	if opts.Resource == "" {
 		return fmt.Errorf("resource must be specified via --resource")
+	}
+
+	// Resource and scope are already resolved by ValidateCommonFlags; build
+	// the client with the explicit kubeconfig to resolve the API group.
+	clientset, err := client.GetClientsetWithKubeconfig(opts.Kubeconfig)
+	if err != nil {
+		return err
 	}
 
 	resolver, err := discovery.NewResourceScopeResolver(clientset.Discovery())

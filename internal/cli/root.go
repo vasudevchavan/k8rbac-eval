@@ -6,43 +6,28 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "kubeaccess",
-	Short: "show or generate access details",
-	Long: `show access by user/sa for namespace/cluster scope 
-also generate access spec. For example:
+	Short: "Inspect and generate Kubernetes RBAC access",
+	Long: `kubeaccess inspects RBAC access levels for users and service accounts
+and generates ready-to-apply Role/ClusterRole manifests.
 
-	"kubeaccess show user testing -n "default""
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
-	// Run: func(cmd *cobra.Command, args []string) { },
+Examples:
+  kubeaccess show user alice -n default --resource pods
+  kubeaccess show sa my-app -n default --resource secrets
+  kubeaccess generate user bob --resource deployments --verb create --verb delete
+  kubeaccess generate sa monitor-sa --resource nodes --verb get --verb list -c`,
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
+// Execute is the entrypoint called by main.
 func Execute() {
-	err := rootCmd.Execute()
-	if err != nil {
+	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
 
 func init() {
-	// Here you will define your flags and configuration settings.
-	// Cobra supports persistent flags, which, if defined here,
-	// will be global for your application.
-
-	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.k8s-get-access-level.yaml)")
-
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
 	rootCmd.AddCommand(AccessCmd)
 	rootCmd.AddCommand(GenerateCmd)
 	rootCmd.AddCommand(VersionCmd)
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
-
 }

@@ -1,6 +1,4 @@
-/*
-Copyright © 2025 NAME HERE <EMAIL ADDRESS>
-*/
+// Copyright © 2025 Vasudev Chavan
 package main
 
 import "github.com/vasudevchavan/k8s-get-access-level/internal/cli"

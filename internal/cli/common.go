@@ -3,6 +3,8 @@ package cli
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -11,16 +13,24 @@ import (
 	"github.com/vasudevchavan/k8s-get-access-level/pkg/discovery"
 )
 
+func init() {
+	// Direct CLI log output to stderr so it doesn't mix with piped/parsed results.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
+}
+
+// AccessOptions holds validated flag values shared across show and generate commands.
 type AccessOptions struct {
 	UserNamespace string
 	ClusterScope  bool
 	Resource      string
+	Kubeconfig    string
 }
 
 func addCommonFlags(cmd *cobra.Command) {
-	cmd.Flags().StringP("namespace", "n", "default", "Namespace Scope")
-	cmd.Flags().String("resource", "", "Kubernetes resource")
-	cmd.Flags().BoolP("clusterscope", "c", false, "Cluster Scope")
+	cmd.Flags().StringP("namespace", "n", "default", "Namespace scope")
+	cmd.Flags().String("resource", "", "Kubernetes resource (e.g. pods, deployments)")
+	cmd.Flags().BoolP("clusterscope", "c", false, "Check cluster-wide access")
+	cmd.Flags().String("kubeconfig", "", "Path to kubeconfig file (defaults to KUBECONFIG env or ~/.kube/config)")
 }
 
 func ValidateCommonFlags(cmd *cobra.Command, args []string) (AccessOptions, error) {
@@ -39,13 +49,18 @@ func ValidateCommonFlags(cmd *cobra.Command, args []string) (AccessOptions, erro
 	if err != nil {
 		return opts, err
 	}
-
-	clientset, err := client.GetClientset()
+	opts.Kubeconfig, err = cmd.Flags().GetString("kubeconfig")
 	if err != nil {
 		return opts, err
 	}
 
-	// If a resource is specified, validate cluster vs namespace
+	// Build client using the explicit kubeconfig (or default resolution).
+	clientset, err := client.GetClientsetWithKubeconfig(opts.Kubeconfig)
+	if err != nil {
+		return opts, err
+	}
+
+	// If a resource is specified, validate its scope and resolve aliases.
 	if opts.Resource != "" {
 		resolved, err := discovery.ResolveResourceName(clientset.Discovery(), opts.Resource)
 		if err != nil {
@@ -66,25 +81,24 @@ func ValidateCommonFlags(cmd *cobra.Command, args []string) (AccessOptions, erro
 		nsFlag := cmd.Flags().Changed("namespace")
 		csFlag := cmd.Flags().Changed("clusterscope")
 
-		//  user passed --namespace for cluster-scoped resource
+		// user passed --namespace for cluster-scoped resource
 		if !namespaced && nsFlag {
 			return opts, fmt.Errorf("resource %q is cluster-scoped; --namespace is not allowed", opts.Resource)
 		}
 
-		//  user passed --clusterscope for namespaced resource
+		// user passed --clusterscope for namespaced resource
 		if namespaced && csFlag && opts.ClusterScope {
 			return opts, fmt.Errorf("resource %q is namespaced; --clusterscope is not allowed", opts.Resource)
 		}
 
-		//  set clusterScope automatically for cluster resources
+		// auto-set clusterScope for cluster-scoped resources
 		if !namespaced {
 			opts.ClusterScope = true
 			opts.UserNamespace = ""
 		}
 
-		//  set default namespace for namespaced resources if not specified
+		// default namespace for namespaced resources
 		if namespaced && !nsFlag {
-			// This might be redundant as flag default is "default", but keeping logic
 			opts.UserNamespace = "default"
 		}
 	}
@@ -96,7 +110,6 @@ func RunAccessCheck(cmd *cobra.Command, args []string, isServiceAccount bool, op
 	username := args[0]
 	displayUsername := username
 	if isServiceAccount {
-		// If namespace is not provided for SA, assume default or use the one set in flags
 		saNamespace := opts.UserNamespace
 		if saNamespace == "" {
 			saNamespace = "default"
@@ -108,24 +121,22 @@ func RunAccessCheck(cmd *cobra.Command, args []string, isServiceAccount bool, op
 		displayUsername = username
 	}
 
-	clientset, err := client.GetClientset()
+	// Create client once; reuse for discovery and impersonation.
+	clientset, err := client.GetClientsetWithKubeconfig(opts.Kubeconfig)
 	if err != nil {
-		return fmt.Errorf("error creating clientset: %v", err)
+		return fmt.Errorf("error creating clientset: %w", err)
 	}
 
 	resolver, err := discovery.NewResourceScopeResolver(clientset.Discovery())
 	if err != nil {
-		return fmt.Errorf("error creating resolver: %v", err)
+		return fmt.Errorf("error creating scope resolver: %w", err)
 	}
 
-	// Load rest config once
-	restCfg, err := client.GetRestConfig()
+	restCfg, err := client.GetRestConfigWithKubeconfig(opts.Kubeconfig)
 	if err != nil {
-		return fmt.Errorf("error loading rest config: %v", err)
+		return fmt.Errorf("error loading rest config: %w", err)
 	}
 
-	// Create impersonated client once
-	// We only include system:authenticated by default.
 	groups := []string{"system:authenticated"}
 	if isServiceAccount {
 		groups = append(groups, "system:serviceaccounts")
@@ -136,7 +147,7 @@ func RunAccessCheck(cmd *cobra.Command, args []string, isServiceAccount bool, op
 
 	impClient, err := access.NewImpersonatedClient(restCfg, username, groups)
 	if err != nil {
-		return fmt.Errorf("error creating impersonated client: %v", err)
+		return fmt.Errorf("error creating impersonated client: %w", err)
 	}
 
 	var resourcesToCheck []string
@@ -145,23 +156,23 @@ func RunAccessCheck(cmd *cobra.Command, args []string, isServiceAccount bool, op
 	} else {
 		resourcesToCheck, err = discovery.GetAllResources(clientset.Discovery())
 		if err != nil {
-			return fmt.Errorf("error fetching resources: %v", err)
+			return fmt.Errorf("error fetching resources: %w", err)
 		}
 	}
 
 	for _, res := range resourcesToCheck {
-		// Skip subresources
+		// Skip subresources (e.g. pods/exec)
 		if strings.Contains(res, "/") {
 			continue
 		}
 
 		namespaced, err := resolver.IsNamespaced(res)
 		if err != nil {
-			slog.Warn("Skipping resource", "resource", res, "error", err)
+			slog.Warn("skipping resource", "resource", res, "error", err)
 			continue
 		}
 
-		// Respect --clusterscope
+		// Respect --clusterscope: skip resources that don't match the requested scope.
 		if opts.ClusterScope && namespaced {
 			continue
 		}
@@ -172,48 +183,28 @@ func RunAccessCheck(cmd *cobra.Command, args []string, isServiceAccount bool, op
 		ns := ""
 		if namespaced {
 			ns = opts.UserNamespace
-			if isServiceAccount {
-				slog.Info("Inspecting access",
-					"service_account", displayUsername,
-					"resource", res,
-					"namespace", ns,
-				)
-			} else {
-				slog.Info("Inspecting access",
-					"user", displayUsername,
-					"resource", res,
-					"namespace", ns,
-				)
-			}
+			slog.Info("inspecting access", "subject", displayUsername, "resource", res, "namespace", ns)
 		} else {
-			if isServiceAccount {
-				slog.Info("Inspecting access",
-					"service_account", displayUsername,
-					"resource", res,
-					"scope", "cluster",
-				)
-			} else {
-				slog.Info("Inspecting access",
-					"user", displayUsername,
-					"resource", res,
-					"scope", "cluster",
-				)
-			}
+			slog.Info("inspecting access", "subject", displayUsername, "resource", res, "scope", "cluster")
 		}
 
 		checker := access.NewKubeChecker(impClient)
-		accessMap, err := checker.Check(
-			cmd.Context(),
-			res,
-			ns,
-		)
+		accessMap, err := checker.Check(cmd.Context(), res, ns)
 		if err != nil {
-			slog.Error("Error checking access", "error", err)
+			slog.Error("error checking access", "resource", res, "error", err)
 			continue
 		}
 
-		for verb, allowed := range accessMap {
-			fmt.Printf("  %-6s : %v\n", verb, allowed)
+		// Sort verbs for deterministic output.
+		verbs := make([]string, 0, len(accessMap))
+		for v := range accessMap {
+			verbs = append(verbs, v)
+		}
+		sort.Strings(verbs)
+
+		fmt.Printf("resource: %s\n", res)
+		for _, verb := range verbs {
+			fmt.Printf("  %-18s : %v\n", verb, accessMap[verb])
 		}
 	}
 	return nil

@@ -2,11 +2,16 @@
 // HTTP API server that wraps the kubeaccess CLI for the Carbon/React UI.
 //
 // Endpoints:
+//   GET  /api/health      – liveness probe
 //   GET  /api/platform    – detected cluster platform + flags
+//   GET  /api/kubeconfigs – list available kubeconfig files
 //   POST /api/check       – run `kubeaccess show {user|sa} <name> [flags]`
 //   POST /api/generate    – run `kubeaccess generate {user|sa} <name> [flags]`
-//   GET  /api/kubeconfigs – list available kubeconfig files
-//   GET  /api/health      – liveness probe
+//
+// Environment variables:
+//   PORT           – listen port (default: 8080)
+//   KUBEACCESS_BIN – explicit path to the kubeaccess binary
+//   CORS_ORIGIN    – allowed CORS origin (default: *, set to your UI origin in production)
 
 package main
 
@@ -26,6 +31,7 @@ import (
 
 	"github.com/vasudevchavan/k8s-get-access-level/pkg/client"
 	"github.com/vasudevchavan/k8s-get-access-level/pkg/platform"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -87,6 +93,7 @@ func (c *platformCache) set(key string, info platform.Info) {
 }
 
 // detectPlatform returns (cached) platform info for a kubeconfig path.
+// It never mutates os.Environ; kubeconfig is passed directly to the client.
 func detectPlatform(kubeconfig string) platform.Info {
 	key := kubeconfig
 	if key == "" {
@@ -96,10 +103,7 @@ func detectPlatform(kubeconfig string) platform.Info {
 		return info
 	}
 
-	if kubeconfig != "" {
-		_ = os.Setenv("KUBECONFIG", kubeconfig)
-	}
-	k8sClient, err := client.GetClientset()
+	k8sClient, err := client.GetClientsetWithKubeconfig(kubeconfig)
 	if err != nil {
 		slog.Warn("platform detection: could not build client", "error", err)
 		info := platform.Info{Platform: platform.TypeVanilla, DisplayName: "Kubernetes"}
@@ -172,32 +176,56 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // buildEnv returns os.Environ() with KUBECONFIG overridden when kubeconfig != "".
+// Used only for exec.Command subprocess calls; never mutates the process environment.
 func buildEnv(kubeconfig string) []string {
 	env := os.Environ()
 	if kubeconfig != "" {
-		env = append(env, "KUBECONFIG="+kubeconfig)
+		// Replace any existing KUBECONFIG entry rather than appending.
+		filtered := env[:0]
+		for _, e := range env {
+			if !strings.HasPrefix(e, "KUBECONFIG=") {
+				filtered = append(filtered, e)
+			}
+		}
+		filtered = append(filtered, "KUBECONFIG="+kubeconfig)
+		return filtered
 	}
 	return env
 }
 
 // roleBindingUserExists returns true when username appears as a subject in any
 // RoleBinding or ClusterRoleBinding across all namespaces.
-func roleBindingUserExists(kubeconfig, username string) bool {
-	cmd := exec.Command("kubectl",
-		"get", "rolebindings,clusterrolebindings",
-		"--all-namespaces",
-		"-o", "jsonpath={.items[*].subjects[*].name}",
-	)
-	cmd.Env = buildEnv(kubeconfig)
-	out, err := cmd.CombinedOutput()
+// Uses client-go rather than shelling out to kubectl.
+func roleBindingUserExists(ctx context.Context, kubeconfig, username string) bool {
+	k8sClient, err := client.GetClientsetWithKubeconfig(kubeconfig)
 	if err != nil {
 		return false
 	}
-	for _, s := range strings.Fields(string(out)) {
-		if s == username {
-			return true
+
+	// Check ClusterRoleBindings
+	crbs, err := k8sClient.RbacV1().ClusterRoleBindings().List(ctx, metav1.ListOptions{})
+	if err == nil {
+		for _, crb := range crbs.Items {
+			for _, s := range crb.Subjects {
+				if s.Name == username {
+					return true
+				}
+			}
 		}
 	}
+
+	// Check RoleBindings across all namespaces
+	rbs, err := k8sClient.RbacV1().RoleBindings("").List(ctx, metav1.ListOptions{})
+	if err == nil {
+		for _, rb := range rbs.Items {
+			for _, s := range rb.Subjects {
+				if s.Name == username {
+					return true
+				}
+			}
+		}
+	}
+
 	return false
 }
 
@@ -205,10 +233,7 @@ func roleBindingUserExists(kubeconfig, username string) bool {
 // Returns (found, skip): skip=true means we cannot determine existence
 // and the request should proceed without blocking.
 func validateUser(ctx context.Context, pInfo platform.Info, kubeconfig, username string) (found, skip bool) {
-	if kubeconfig != "" {
-		_ = os.Setenv("KUBECONFIG", kubeconfig)
-	}
-	typedClient, err := client.GetClientset()
+	typedClient, err := client.GetClientsetWithKubeconfig(kubeconfig)
 	if err != nil {
 		return false, true // can't validate, let through
 	}
@@ -221,7 +246,7 @@ func validateUser(ctx context.Context, pInfo platform.Info, kubeconfig, username
 			return true, false
 		}
 		// Fall back to RoleBinding scan for system users / service users
-		return roleBindingUserExists(kubeconfig, username), false
+		return roleBindingUserExists(ctx, kubeconfig, username), false
 
 	case platform.TypeEKS:
 		// Check aws-auth ConfigMap; skip if absent (EKS Access Entries clusters)
@@ -233,17 +258,17 @@ func validateUser(ctx context.Context, pInfo platform.Info, kubeconfig, username
 			return false, true // can't determine
 		}
 		// Also check RoleBindings for users with direct k8s bindings
-		return roleBindingUserExists(kubeconfig, username), false
+		return roleBindingUserExists(ctx, kubeconfig, username), false
 
 	case platform.TypeAKS:
 		if pInfo.AzureRBACMode {
 			// Azure RBAC mode: users never appear in Kubernetes RoleBindings
 			return false, true
 		}
-		return roleBindingUserExists(kubeconfig, username), false
+		return roleBindingUserExists(ctx, kubeconfig, username), false
 
 	default:
-		return roleBindingUserExists(kubeconfig, username), false
+		return roleBindingUserExists(ctx, kubeconfig, username), false
 	}
 }
 
@@ -257,6 +282,10 @@ func buildUserNotFoundMsg(pInfo platform.Info, username string) string {
 		return fmt.Sprintf(
 			"user %q not found — "+
 				"not in aws-auth ConfigMap and has no RoleBinding on this EKS cluster", username)
+	case platform.TypeAKS:
+		return fmt.Sprintf(
+			"user %q has no RoleBinding or ClusterRoleBinding on this AKS cluster — "+
+				"if using Azure RBAC, access is managed via Azure role assignments, not Kubernetes RBAC", username)
 	default:
 		return fmt.Sprintf(
 			"user %q has no RoleBinding or ClusterRoleBinding in this cluster — "+
@@ -359,27 +388,21 @@ func handleCheck(binary string) http.HandlerFunc {
 				ns = "default"
 			}
 
-			// Validate SA existence via kubectl
-			saCmd := exec.Command("kubectl", "get", "sa", req.Name, "-n", ns)
-			saCmd.Env = buildEnv(req.Kubeconfig)
-			if out, err := saCmd.CombinedOutput(); err != nil {
-				msg := strings.TrimSpace(string(out))
-				if msg == "" {
-					msg = err.Error()
-				}
+			// Validate SA existence via client-go
+			k8sClient, err := client.GetClientsetWithKubeconfig(req.Kubeconfig)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, APIResponse{Error: "failed to build k8s client: " + err.Error()})
+				return
+			}
+			if _, err := k8sClient.CoreV1().ServiceAccounts(ns).Get(ctx, req.Name, metav1.GetOptions{}); err != nil {
 				writeJSON(w, http.StatusBadRequest, APIResponse{
-					Error: fmt.Sprintf("service account %q not found in namespace %q: %s", req.Name, ns, msg),
+					Error: fmt.Sprintf("service account %q not found in namespace %q", req.Name, ns),
 				})
 				return
 			}
 
 			// Cloud identity annotation warnings (IRSA / Workload Identity)
-			if kubeconfig := req.Kubeconfig; kubeconfig != "" {
-				_ = os.Setenv("KUBECONFIG", kubeconfig)
-			}
-			if k8sClient, err := client.GetClientset(); err == nil {
-				warnings = platform.SACloudWarnings(ctx, k8sClient, req.Name, ns)
-			}
+			warnings = platform.SACloudWarnings(ctx, k8sClient, req.Name, ns)
 
 		} else {
 			// Platform-aware user validation
@@ -406,6 +429,9 @@ func handleCheck(binary string) http.HandlerFunc {
 			args = append(args, "--clusterscope")
 		} else if req.Namespace != "" {
 			args = append(args, "--namespace", req.Namespace)
+		}
+		if req.Kubeconfig != "" {
+			args = append(args, "--kubeconfig", req.Kubeconfig)
 		}
 
 		slog.Info("running check", "args", args, "platform", pInfo.Platform)
@@ -466,6 +492,9 @@ func handleGenerate(binary string) http.HandlerFunc {
 		} else if req.Namespace != "" {
 			args = append(args, "--namespace", req.Namespace)
 		}
+		if req.Kubeconfig != "" {
+			args = append(args, "--kubeconfig", req.Kubeconfig)
+		}
 
 		pInfo := detectPlatform(req.Kubeconfig)
 		slog.Info("running generate", "args", args, "platform", pInfo.Platform)
@@ -502,9 +531,19 @@ func handleGenerate(binary string) http.HandlerFunc {
 // CORS middleware
 // ────────────────────────────────────────────────────────────────────────────
 
+// corsOrigin returns the allowed CORS origin from CORS_ORIGIN env (default: "*").
+// Set CORS_ORIGIN to your UI's origin (e.g. http://localhost:3000) in production.
+func corsOrigin() string {
+	if o := os.Getenv("CORS_ORIGIN"); o != "" {
+		return o
+	}
+	return "*"
+}
+
 func withCORS(next http.Handler) http.Handler {
+	origin := corsOrigin()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
@@ -544,7 +583,7 @@ func main() {
 		addr = ":" + p
 	}
 
-	slog.Info("KubeAccess API server starting", "addr", addr)
+	slog.Info("KubeAccess API server starting", "addr", addr, "corsOrigin", corsOrigin())
 	if err := http.ListenAndServe(addr, withCORS(mux)); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
